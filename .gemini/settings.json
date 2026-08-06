@@ -1,0 +1,19 @@
+{
+  "_comment": "AI-FAQ用のGemini CLI設定。Web調査のみを許可し、ファイル書換・シェル実行・メモリ保存ツールは無効化する。キー名は実装時点(2026-08-06)のCLIバージョン(0.50.0)に基づく暫定値。導入環境のバージョンに合わせて `gemini` の公式ドキュメント/設定スキーマで再確認すること。",
+  "tools": {
+    "core": ["web_search", "web_fetch"],
+    "exclude": [
+      "run_shell_command",
+      "write_file",
+      "edit",
+      "replace",
+      "save_memory"
+    ]
+  },
+  "general": {
+    "checkpointing": { "enabled": false }
+  },
+  "context": {
+    "includeDirectories": []
+  }
+}

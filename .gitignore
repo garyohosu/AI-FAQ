@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# App data (SQLite DB, logs, caches, checkpoints)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Knowledge: only knowledge/public/ samples are tracked by default. All other
+# subfolders may hold real internal material locally, so only their README
+# placeholder is committed (instruction-2026-08-06-003).
+knowledge/internal/*
+!knowledge/internal/README.md
+knowledge/policies/*
+!knowledge/policies/README.md
+knowledge/procedures/*
+!knowledge/procedures/README.md
+knowledge/troubleshooting/*
+!knowledge/troubleshooting/README.md
+knowledge/inventory/*
+!knowledge/inventory/README.md
+knowledge/inbox/*
+!knowledge/inbox/README.md
+
+# Local secrets / env
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
