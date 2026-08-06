@@ -72,6 +72,16 @@ class Settings:
     max_clarification_rounds: int = 3
     log_level: str = "INFO"
 
+    # --- 2ターミナル運用 / SQLite共有 (instruction-006 §6) ------------------
+    #: ロック競合時にSQLite側で待つ時間(ミリ秒)。接続ごとに設定する。
+    busy_timeout_ms: int = 5000
+    #: `aifaq watch` の既定ポーリング間隔(秒)。
+    watch_interval_seconds: float = 2.0
+    #: ポーリング間隔の下限。DBを叩きすぎないための保護 (§4.2)。
+    watch_min_interval_seconds: float = 0.5
+    #: 人間回答本文の最大文字数 (§8)。
+    max_answer_chars: int = 20_000
+
     # 知識取り込みの上限 (行数・列数・セル文字数・ファイルサイズ)
     max_import_rows: int = 5000
     max_import_cols: int = 50
@@ -124,4 +134,7 @@ class Settings:
             memory_index_path=Path(os.environ.get("AIFAQ_MEMORY_INDEX", "MEMORY.md")),
             max_clarification_rounds=min(3, max(0, max_rounds)),
             log_level=os.environ.get("AIFAQ_LOG_LEVEL", "INFO"),
+            busy_timeout_ms=int(os.environ.get("AIFAQ_BUSY_TIMEOUT_MS", "5000")),
+            watch_interval_seconds=float(os.environ.get("AIFAQ_WATCH_INTERVAL", "2.0")),
+            max_answer_chars=int(os.environ.get("AIFAQ_MAX_ANSWER_CHARS", "20000")),
         )

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from aifaq import db as db_module
 from aifaq.models import (
+    ClarificationSummary,
     ClarificationTurn,
     KnowledgeArticle,
     KnowledgeMatch,
@@ -17,6 +18,8 @@ from aifaq.models import (
     PendingStatus,
     SourceChunk,
     SourceFileRecord,
+    ThreadState,
+    ThreadStatus,
 )
 from aifaq.util import (
     extract_search_terms,
@@ -338,6 +341,15 @@ class KnowledgeRepository:
 # ---------------------------------------------------------------------------
 
 
+class AlreadyAnsweredError(ValueError):
+    """既に回答済みのpendingへ再度回答しようとした。
+
+    既存回答を上書きせず、明確なエラーとして扱う (instruction-006 §4.3)。
+    従来 `answer()` は `ValueError` を送出していたため、既存の呼び出し側と
+    テストの互換性を保つよう `ValueError` を継承する。
+    """
+
+
 class PendingRepository:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
@@ -396,15 +408,48 @@ class PendingRepository:
         valid_until: str | None = None,
         change_reason: str = "IT管理者による人間回答",
     ) -> int:
-        """人間の回答を承認済み知識として保存し、pendingをANSWEREDにする。"""
+        """人間の回答を保存する。
+
+        次を1つのトランザクションで行う (instruction-006 §4.3)。
+
+        1. 承認済み知識として `knowledge_articles` へ保存(従来どおり)
+        2. **元のpendingへ回答本文・回答者・回答日時を保存**
+        3. pendingを `ANSWERED` にする
+        4. 元のthread_idへ紐付けて `query_history` へ記録
+
+        二重回答は `WHERE id=? AND status='OPEN'` の更新件数で防ぐ。
+        SELECTで確認してからUPDATEするだけでは、2つのターミナルから
+        同時に実行されたときに両方が通ってしまうため、更新条件自体に
+        状態を含めて不可分に判定する。
+        """
         row = self.get(pending_id)
         if row is None:
             raise ValueError(f"pending question {pending_id} not found")
         if row["status"] != PendingStatus.OPEN.value:
-            raise ValueError(f"pending question {pending_id} is not OPEN")
+            raise AlreadyAnsweredError(
+                f"pending question {pending_id} は既に {row['status']} です"
+            )
 
         knowledge_repo = KnowledgeRepository(self.conn)
+        ts = now_iso()
         with self.conn:
+            # 先に「OPEN のものだけを ANSWERED にする」更新を行い、
+            # 勝ち取れた場合のみ知識を作る。負けた側は0件更新で検出できる。
+            cur = self.conn.execute(
+                """
+                UPDATE pending_questions
+                SET status='ANSWERED', answered_at=?, answered_by=?,
+                    answer_text=?, answer_type='HUMAN', updated_at=?
+                WHERE id=? AND status='OPEN'
+                """,
+                (ts, approved_by, answer_text, ts, pending_id),
+            )
+            if cur.rowcount == 0:
+                raise AlreadyAnsweredError(
+                    f"pending question {pending_id} は既に回答済みです"
+                    "(他のターミナルから先に回答された可能性があります)"
+                )
+
             knowledge_id = knowledge_repo.create(
                 canonical_question=row["original_question"],
                 answer=answer_text,
@@ -417,22 +462,58 @@ class PendingRepository:
                 change_reason=change_reason,
             )
             self.conn.execute(
+                "UPDATE pending_questions SET resulting_knowledge_id=? WHERE id=?",
+                (knowledge_id, pending_id),
+            )
+            # 元のthreadの履歴にも人間回答を残す。
+            self.conn.execute(
                 """
-                UPDATE pending_questions
-                SET status='ANSWERED', answered_at=?, answered_by=?,
-                    resulting_knowledge_id=?
-                WHERE id=?
+                INSERT INTO query_history
+                (thread_id, question, classification_json, route, answer_type,
+                 knowledge_ids_json, research_run_id, created_at)
+                VALUES (?, ?, ?, 'human', 'HUMAN_ANSWER', ?, NULL, ?)
                 """,
-                (now_iso(), approved_by, knowledge_id, pending_id),
+                (
+                    row["thread_id"],
+                    row["original_question"],
+                    row["classification_json"],
+                    _dumps([knowledge_id]),
+                    ts,
+                ),
             )
         return knowledge_id
 
-    def cancel(self, pending_id: int) -> None:
+    def mark_delivered(self, pending_id: int) -> None:
+        """質問者が回答を受け取ったことを記録する。
+
+        「回答の保存」と「質問者が読んだこと」は分離する (§7)。
+        受領しても状態は `ANSWERED` のままで、`delivered_at` だけを更新する。
+        初回受領の時刻を保ちたいので、既に記録済みなら上書きしない。
+        """
         with self.conn:
             self.conn.execute(
-                "UPDATE pending_questions SET status='CANCELLED', answered_at=? WHERE id=?",
+                """
+                UPDATE pending_questions
+                SET delivery_status='DELIVERED', delivered_at=?
+                WHERE id=? AND delivered_at IS NULL
+                """,
                 (now_iso(), pending_id),
             )
+
+    def cancel(self, pending_id: int) -> None:
+        ts = now_iso()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE pending_questions "
+                "SET status='CANCELLED', answered_at=?, updated_at=? WHERE id=?",
+                (ts, ts, pending_id),
+            )
+
+    def get_latest_by_thread(self, thread_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM pending_questions WHERE thread_id=? ORDER BY id DESC LIMIT 1",
+            (thread_id,),
+        ).fetchone()
 
 
 # ---------------------------------------------------------------------------
@@ -1042,3 +1123,91 @@ class Repositories:
             memory_entries=MemoryEntryRepository(conn),
             import_runs=SourceImportRunRepository(conn),
         )
+
+    # -- 状態取得 (instruction-006 §4.1 / §5) -------------------------------
+
+    def thread_status(
+        self, *, thread_id: str | None = None, pending_id: int | None = None
+    ) -> ThreadStatus:
+        """スレッドの現在状態をまとめて返す。
+
+        CLIが複数テーブルを場当たり的に読まずに済むよう、状態の組み立ては
+        すべてここで行う。`status` と `watch` の両方がこれを使う。
+
+        判定順は「pendingの状態 → 未回答の確認質問 → 履歴の完了」。
+        pendingが最優先なのは、人間引き継ぎが最も強い状態だから。
+        """
+        pending = None
+        if pending_id is not None:
+            pending = self.pending.get(pending_id)
+            if pending is None:
+                return ThreadStatus(thread_id=thread_id or "", state=ThreadState.NOT_FOUND)
+            thread_id = pending["thread_id"]
+        elif thread_id is not None:
+            pending = self.pending.get_latest_by_thread(thread_id)
+
+        if not thread_id:
+            return ThreadStatus(thread_id="", state=ThreadState.NOT_FOUND)
+
+        clarifications = [
+            ClarificationSummary(round_no=t.round_no, question=t.question, answer=t.answer)
+            for t in self.clarifications.list_for_thread(thread_id)
+        ]
+        history = self.history.list_for_thread(thread_id)
+
+        if pending is None and not clarifications and not history:
+            return ThreadStatus(thread_id=thread_id, state=ThreadState.NOT_FOUND)
+
+        base = {
+            "thread_id": thread_id,
+            "clarifications": clarifications,
+        }
+
+        if pending is not None:
+            base["pending_id"] = int(pending["id"])
+            base["original_question"] = pending["original_question"]
+            base["created_at"] = parse_iso(pending["created_at"])
+
+            status = pending["status"]
+            if status == PendingStatus.ANSWERED.value:
+                return ThreadStatus(
+                    **base,
+                    state=ThreadState.ANSWERED,
+                    answer=pending["answer_text"],
+                    answer_type=pending["answer_type"] or "HUMAN",
+                    answered_by=pending["answered_by"],
+                    answered_at=parse_iso(pending["answered_at"]),
+                    delivery_status=pending["delivery_status"],
+                    delivered_at=parse_iso(pending["delivered_at"]),
+                    knowledge_id=pending["resulting_knowledge_id"],
+                )
+            if status == PendingStatus.CANCELLED.value:
+                return ThreadStatus(
+                    **base,
+                    state=ThreadState.CANCELLED,
+                    answered_at=parse_iso(pending["answered_at"]),
+                )
+            return ThreadStatus(**base, state=ThreadState.PENDING_HUMAN)
+
+        open_turn = self.clarifications.get_open_turn(thread_id)
+        if open_turn is not None:
+            return ThreadStatus(
+                **base,
+                state=ThreadState.NEEDS_CLARIFICATION,
+                original_question=history[0]["question"] if history else None,
+                next_question=open_turn["question"],
+                options=json.loads(open_turn["options_json"] or "[]"),
+                created_at=parse_iso(open_turn["asked_at"]),
+            )
+
+        if history:
+            last = history[-1]
+            return ThreadStatus(
+                **base,
+                state=ThreadState.COMPLETED,
+                original_question=history[0]["question"],
+                answer_type=last["answer_type"],
+                created_at=parse_iso(last["created_at"]),
+            )
+
+        return ThreadStatus(thread_id=thread_id, state=ThreadState.NOT_FOUND)

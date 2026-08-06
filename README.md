@@ -177,6 +177,21 @@ agy --print "<調査指示>" --output-format json
 旧 `AIFAQ_GEMINI_BIN` も当面読みますが、使用すると非推奨警告を出します。
 `AIFAQ_RESEARCH_BIN` へ移行してください。
 
+2ターミナル運用まわりの設定:
+
+| 環境変数 | 既定値 | 説明 |
+|---|---|---|
+| `AIFAQ_DB_PATH` | `data/aifaq.db` | 共有するSQLite DB。試験用DBの指定にも使う |
+| `AIFAQ_BUSY_TIMEOUT_MS` | `5000` | ロック競合時にSQLite側で待つ時間(ミリ秒) |
+| `AIFAQ_WATCH_INTERVAL` | `2.0` | `aifaq watch` の既定ポーリング間隔(秒) |
+| `AIFAQ_MAX_ANSWER_CHARS` | `20000` | 人間回答本文の最大文字数 |
+
+実機試験の回答を本番の知識へ残したくない場合は、専用DBを指定します。
+
+```bash
+AIFAQ_DB_PATH=data/test.db aifaq ask "テスト質問" --thread-id t-001
+```
+
 ### 調査指示の渡し方(`AIFAQ_RESEARCH_TRANSPORT`)
 
 - **`arg`(既定・実機確認済み)**: 調査指示をコマンドライン引数として渡します。
@@ -228,6 +243,11 @@ aifaq research approve ID --approved-by 名前 # 承認済み知識へ昇格
 aifaq research approve ID --approved-by 名前 --answer-file corrected.md  # 修正して承認
 aifaq research reject ID --approved-by 名前 --reason "情報が古い"
 aifaq research reject ID --approved-by 名前 --expired                    # 期限切れ
+aifaq status THREAD                         # 状態と回答を一度だけ確認
+aifaq status --pending-id 12                # 受付番号で確認
+aifaq watch THREAD                          # 回答が入るまで待つ
+aifaq watch THREAD --interval 1 --timeout 120
+aifaq chat --requester 山田                  # 対話モード
 aifaq memory validate                       # MEMORY.mdの形式検証
 aifaq memory show                           # MEMORY.mdの内容表示
 aifaq memory sync                           # Markdown → DBへ同期
@@ -281,10 +301,184 @@ echo "情報システム部の内線1234へ連絡してください。" | \
 `source_type=HUMAN, status=APPROVED` の承認済み知識として保存され、
 次回以降の類似質問(完全一致・別表現・全文検索)で再利用されます。
 
-**AI調査結果(`INTERNET_RESEARCH`)を承認済み知識へ昇格させるCLIコマンドは
-本MVPには未実装です**(「既知の制約」参照)。AI調査結果はその場の暫定回答
-としてのみ提示され、自動的にも手動的にも承認済み知識(`knowledge_articles`)
-へは保存されません。
+AI調査結果(`INTERNET_RESEARCH`)は自動ではナレッジ化されません。人間が
+`aifaq research approve` で確認・承認したものだけが承認済み知識になります
+(「CLI使用例」の `research` コマンド参照)。
+
+## 2ターミナルでの使い方(質問者とIT管理者)
+
+同じリポジトリフォルダを2つのターミナルで開き、同じ `data/aifaq.db` を
+共有して運用します。UIはまだありません。
+
+```text
+ターミナルA: 質問者        ターミナルB: IT管理者
+```
+
+### ターミナルA(質問者)
+
+```bash
+aifaq ask "第2工場のPC交換申請先は？" --thread-id demo-001 --requester 山田
+```
+
+人間引き継ぎになると、受付番号と次の操作が表示されます。
+
+```text
+IT管理者へ引き継ぎました。
+受付番号: 12
+thread_id: demo-001
+状態: 回答待ち
+
+後から次のコマンドで確認できます:
+  aifaq status demo-001
+
+回答を待ち続ける場合:
+  aifaq watch demo-001
+```
+
+### ターミナルB(IT管理者)
+
+```bash
+aifaq pending list
+aifaq pending show 12
+echo "PC交換申請は情報システム部へ提出してください。" | \
+    aifaq pending answer 12 --approved-by hantani --category procedure \
+    --tags pc,申請 --reason "初回回答として承認"
+```
+
+### ターミナルA(回答の受け取り)
+
+```bash
+aifaq status demo-001    # 今の状態を一度だけ確認する
+aifaq watch demo-001     # 回答が入るまで待つ
+```
+
+### `status` と `watch` の違い
+
+| | `status` | `watch` |
+|---|---|---|
+| 動作 | 現在の状態を1回表示して終了 | 回答が入るまでポーリングして待つ |
+| 用途 | 後から確認する | その場で待ち続ける |
+| 間隔 | — | `--interval`(既定2.0秒、最短0.5秒) |
+| 上限 | — | `--timeout SECONDS`(省略時は無制限) |
+
+`watch` の終了コード:
+
+| 終了コード | 意味 |
+|---|---|
+| `0` | 回答済み・取り下げ・対応済みのいずれかを検知して終了 |
+| `1` | 対象のthread_id / 受付番号が見つからない |
+| `2` | 引数が不正(`--interval` が下限未満など) |
+| `3` | `--timeout` に達した(状態は保持される) |
+| `130` | Ctrl+Cで待機を中止(回答はDBに残る) |
+
+`watch` の進捗表示は標準エラー出力へ出すため、`aifaq --json watch ...` の
+標準出力はJSONとしてそのまま解析できます。
+
+### 人間回答が質問者へ返る仕組み
+
+`aifaq pending answer` は1つのトランザクションで次を行います。
+
+1. 承認済み知識(`knowledge_articles`)として保存
+2. **元の `pending_questions` 行へ回答本文・回答者・回答日時を保存**
+3. pendingを `ANSWERED` にする
+4. 元の `thread_id` へ紐付けて `query_history` へ記録
+
+質問者の `status` / `watch` は、この pending 行を `thread_id`(または
+受付番号)で引いて回答を返します。したがって質問者は、同じ質問を送り直す
+ことなく、元のスレッドのまま回答を受け取れます。
+
+#### LangGraphのチェックポイントを進めない理由
+
+`request_human` は LangGraph の `interrupt()` でスレッドを中断します。
+IT管理者が回答したとき、このチェックポイントを「人間回答を受け取った完了
+状態」へ再開させる設計も考えられますが、**採用していません**。理由は次の
+とおりです。
+
+- 再開するには IT管理者側のプロセスが、質問者のグラフを
+  `Command(resume=...)` で進めることになります。回答を書き込んだ人が、
+  他人のワークフローを進めることになり、責務が逆転します。
+- グラフの再開は業務状態の更新(pendingとknowledgeの保存)と同じ
+  トランザクションに入れられません。片方だけ成功する状態が生まれます。
+- 質問者が `status` を実行するのは、回答から数時間後かもしれません。
+  そのときにグラフを再開しても、得られるのはSQLiteに既にある回答です。
+
+そのため**業務状態はSQLite側を正**とし、`status` / `watch` は
+`pending_questions` から回答を返します。チェックポイントは中断したまま
+残りますが、`thread_id` は再利用されず、次の質問は新しいスレッドになるため
+実害はありません。
+
+回答の**保存**と、質問者が**読んだこと**は分離しています。`status` /
+`watch` で受け取ると `delivered_at` が記録されますが、状態は `ANSWERED` の
+ままで、回答は消えません。何度でも取得できます。
+
+### 人間回答は次回以降の承認済み知識になる
+
+同じ回答が `source_type=HUMAN` の承認済み知識として保存されるため、次回の
+同じ質問では人間を待たずに即座に回答されます。これがこのプロジェクトで
+いう「学習」です。
+
+**言い換えた質問にも効かせるには `--variants` を登録してください。**
+
+```bash
+aifaq pending answer 12 --approved-by hantani --category procedure \
+    --variants "PC交換の申請先はどこですか,パソコン交換の申請先,PC交換申請の提出先"
+```
+
+再利用が効くのは次の場合です。
+
+| 質問 | 再利用 |
+|---|---|
+| 登録時と同じ文言 | ○(完全一致) |
+| `--variants` に登録した別表現 | ○(完全一致) |
+| 語がそのまま含まれる質問(部分一致) | ○(全文検索) |
+| 未登録の言い換え | △ 確認質問へ進む場合があります |
+
+未登録の言い換えは、語のOR検索では一致しても意図的にスコアを閾値未満に
+抑えています。曖昧な一致だけで確認質問や人間引き継ぎを飛ばさないための
+安全側の設計です。運用では、よくある言い換えを `--variants` へ足していく
+ことで精度が上がります。
+
+### 対話モード(`aifaq chat`)
+
+確認質問を繰り返す対話モードもあります。
+
+```bash
+aifaq chat --requester 山田
+```
+
+```text
+AI-FAQ CLI
+終了: /quit
+状態確認: /status
+
+あなた> 社内Wi-Fiにつながりません
+AI-FAQ> 接続方法は有線と無線のどちらですか？
+  1. 有線(LAN)
+  2. 無線(Wi-Fi)
+  3. 両方で発生
+```
+
+人間引き継ぎになった場合は、そのまま待つか終了するかを選べます。
+FAQロジックは `ask` / `reply` と同じものを再利用しています。
+
+### SQLiteを共有するときの注意
+
+2つのターミナルが同じ `data/aifaq.db` へ別プロセスからアクセスします。
+そのため接続ごとに次を設定しています。
+
+- `PRAGMA journal_mode=WAL`: 質問者の `watch`(読み)が、IT管理者の
+  `pending answer`(書き)をブロックしません。
+- `PRAGMA busy_timeout`(既定5000ms、`AIFAQ_BUSY_TIMEOUT_MS` で変更可):
+  ロック競合時にSQLite側で待ちます。
+- `watch` はポーリングのたびに接続を開いて短い読み取りで閉じるため、
+  DBを長時間ロックしません。
+
+それでもロックが解消しない場合は、無限に再試行せず、対処方法を含む
+エラーメッセージを表示して終了します。
+
+同じpendingへ2人が同時に回答した場合は、**先に書き込んだ側だけが成功**し、
+後から来た側は明確なエラー(終了コード2)になります。既存の回答が上書き
+されることはありません。
 
 ## Excel・テキスト知識の置き方
 
@@ -362,6 +556,31 @@ aifaq knowledge search "Wi-Fi"  # 承認済み知識 + 取り込み資料を横�
 - `knowledge/**/README.md` はフォルダ説明用の付属文書なので取り込みません。
 - 危険な操作(アカウント削除・権限変更・ネットワーク遮断等)を自動実行する
   機能はありません。FAQとして手順を提示するだけです。
+- 人間回答は外部AIへ送信しません。IT管理者が書いた回答本文はSQLiteに
+  保存され、Antigravityへ渡ることはありません。
+- 回答本文は保存前に検証します。空文字、上限(既定20,000文字、
+  `AIFAQ_MAX_ANSWER_CHARS`)超過、改行・タブ以外の制御文字は拒否します。
+- `status` / `watch` は指定された `thread_id`(または受付番号)の情報だけを
+  返します。thread_id・受付番号はSQLのプレースホルダーで渡し、SQL文字列へ
+  連結しません。
+
+## 認証なしCLI版の利用範囲
+
+**このCLI版には認証・アクセス制御がありません。** 次を前提としています。
+
+- 同じPC・同じOSユーザー、または信頼された管理環境での利用
+- `data/aifaq.db` を読める利用者は、**すべての質問・回答履歴を参照できます**
+  (`aifaq status` は任意の `thread_id` / 受付番号を指定できます)
+- 誰が質問者で誰がIT管理者かを、システムは検証しません。
+  `--approved-by` は自己申告の記録項目です
+
+複数の社員へ配布して本番運用する前には、認証付きWeb UI、またはOSの
+ファイル権限やネットワーク分離といった別のアクセス制御が必要です。
+
+なお、`ask` / `reply` / `pending answer` / `status` の業務ロジックは
+サービス層(`graph.run_ask` / `run_reply`、`repositories`)に置いてあり、
+CLIはその薄い呼び出しです。将来Web UIへ移行する際も、このサービス層を
+そのまま再利用できます。
 
 ## テスト方法
 
@@ -372,6 +591,11 @@ python -m pytest -q --cov=aifaq --cov-report=term-missing
 
 外部ネットワークと実AI CLI(Antigravity)は一切呼び出さず、
 `FakeResearchProvider` または `unittest.mock` によるモックのみで完結します。
+
+2ターミナル運用は `tests/test_two_terminal_integration.py` で、実際に
+`subprocess` でCLIを別プロセス起動して検証しています(`watch` 起動中に
+別プロセスから回答し、`watch` が検知して終了することを確認)。
+別プロセス起動を伴うため、このファイルだけは実行に1分程度かかります。
 
 CI(GitHub Actions)は Python 3.12 / 3.13 の両方で実行し、
 `AIFAQ_RESEARCH_PROVIDER=fake` を設定したうえで `agy` が

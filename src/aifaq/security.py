@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from aifaq.models import QuestionClassification, QuestionScope
 
@@ -162,3 +163,46 @@ def redact_for_storage(text: str) -> str:
     if contains_secret_like(redacted):
         redacted = "[この回答には秘密情報らしき語が含まれていたため保存前に伏字にしました]"
     return redacted
+
+
+class AnswerValidationError(ValueError):
+    """人間回答の本文が受け入れ条件を満たさない。"""
+
+
+#: 制御文字のうち、本文へ含めてよいもの(改行・復帰・タブ)。
+_ALLOWED_CONTROL_CHARS = {"\n", "\r", "\t"}
+
+
+def validate_human_answer(text: str, *, max_chars: int) -> str:
+    """IT管理者の回答本文を検証して返す (instruction-006 §8)。
+
+    標準入力経由で任意の内容が渡るため、次を拒否する。
+
+    - 空文字
+    - 上限を超える極端な長文(DBと表示を壊さないため)
+    - 改行・タブ以外の制御文字(端末制御シーケンスの混入を防ぐ)
+
+    秘密情報の扱いは既存の伏字化ポリシー(`redact_for_storage`)に従い、
+    ここでは行わない。回答本文そのものは伏字化せずに保存する
+    (IT管理者が意図して書いた業務回答であるため)。
+    """
+    if not text or not text.strip():
+        raise AnswerValidationError("回答本文が空です")
+    if len(text) > max_chars:
+        raise AnswerValidationError(
+            f"回答本文が長すぎます({len(text)}文字 > 上限{max_chars}文字)"
+        )
+    bad = sorted(
+        {
+            ch
+            for ch in text
+            if unicodedata.category(ch) in ("Cc", "Cf")
+            and ch not in _ALLOWED_CONTROL_CHARS
+        }
+    )
+    if bad:
+        codes = ", ".join(f"U+{ord(ch):04X}" for ch in bad)
+        raise AnswerValidationError(
+            f"回答本文に使用できない制御文字が含まれています({codes})"
+        )
+    return text

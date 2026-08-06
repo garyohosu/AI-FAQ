@@ -271,6 +271,82 @@ class FAQAnswer(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Thread status (instruction 006 §4.1 / §5)
+# ---------------------------------------------------------------------------
+
+
+class ThreadState(StrEnum):
+    """`aifaq status` / `aifaq watch` が返すスレッドの状態。
+
+    `PendingStatus` は pending_questions 行の状態だけを表すのに対し、
+    こちらは「質問者から見たスレッド全体の状態」を表す。
+    """
+
+    #: 確認質問に回答待ち(質問者のアクション待ち)
+    NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
+    #: IT管理者の回答待ち
+    PENDING_HUMAN = "PENDING_HUMAN"
+    #: IT管理者が回答済み
+    ANSWERED = "ANSWERED"
+    #: 取り下げ
+    CANCELLED = "CANCELLED"
+    #: 人間引き継ぎを経ずにAI・知識で完了した
+    COMPLETED = "COMPLETED"
+    #: 該当するスレッド・pendingが無い
+    NOT_FOUND = "NOT_FOUND"
+
+
+class ClarificationSummary(BaseModel):
+    """`status` 出力用の確認質問履歴の要約。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    round_no: int
+    question: str
+    answer: str | None = None
+
+
+class ThreadStatus(BaseModel):
+    """CLIの状態表示用レスポンス。
+
+    CLIが複数テーブルを場当たり的に読むのではなく、リポジトリ層が
+    このモデルを組み立てて返す (instruction-006 §5)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    thread_id: str
+    state: ThreadState
+    pending_id: int | None = None
+    original_question: str | None = None
+    #: 現在の状態に対応する回答本文(人間回答またはAI/知識の回答)
+    answer: str | None = None
+    #: 回答の種別 (HUMAN / KNOWLEDGE / INTERNET_RESEARCH など)
+    answer_type: str | None = None
+    answered_by: str | None = None
+    created_at: datetime | None = None
+    answered_at: datetime | None = None
+    delivery_status: str | None = None
+    delivered_at: datetime | None = None
+    #: 人間回答が承認済み知識になった場合のID
+    knowledge_id: int | None = None
+    sources: list[ResearchSource] = Field(default_factory=list)
+    clarifications: list[ClarificationSummary] = Field(default_factory=list)
+    #: 確認質問待ちのときに、質問者へ示す次の質問
+    next_question: str | None = None
+    options: list[str] = Field(default_factory=list)
+
+    @property
+    def is_final(self) -> bool:
+        """`watch` がこれ以上待つ必要がない状態か。"""
+        return self.state in (
+            ThreadState.ANSWERED,
+            ThreadState.CANCELLED,
+            ThreadState.COMPLETED,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Source ingestion (instruction 003)
 # ---------------------------------------------------------------------------
 

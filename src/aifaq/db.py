@@ -8,11 +8,12 @@ LIKE検索へフォールバックできるようにする。
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 from aifaq.config import Settings
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS knowledge_articles (
@@ -61,7 +62,15 @@ CREATE TABLE IF NOT EXISTS pending_questions (
     created_at TEXT NOT NULL,
     answered_at TEXT,
     answered_by TEXT,
-    resulting_knowledge_id INTEGER REFERENCES knowledge_articles(id)
+    resulting_knowledge_id INTEGER REFERENCES knowledge_articles(id),
+    -- schema v3: 人間回答を元の質問者へ返すための列 (instruction-006 §5)
+    -- answered_at / answered_by / resulting_knowledge_id は既存のものを使い、
+    -- 同等項目を重複して追加しない。
+    answer_text TEXT,
+    answer_type TEXT NOT NULL DEFAULT 'HUMAN',
+    delivery_status TEXT NOT NULL DEFAULT 'UNDELIVERED',
+    delivered_at TEXT,
+    updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS query_history (
@@ -205,12 +214,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 # フォールバックする)。
 
 
-#: schema v1 で作られた既存DBへ後から足す列。
+#: 既存DBへ後から足す列(スキーマ版ごと)。
 #: ``CREATE TABLE IF NOT EXISTS`` は既存テーブルの列を増やさないため、
-#: ``ALTER TABLE ... ADD COLUMN`` で冪等に追加する。
+#: ``ALTER TABLE ... ADD COLUMN`` で冪等に追加する。既存DBは削除しない。
 #: SQLite の ADD COLUMN は非定数 DEFAULT と REFERENCES 付き NOT NULL を
 #: 受け付けないので、ここでは定数 DEFAULT または NULL 許容のみを使う。
-_V2_COLUMNS: dict[str, dict[str, str]] = {
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "research_runs": {
         "answer": "TEXT NOT NULL DEFAULT ''",
         "review_status": "TEXT NOT NULL DEFAULT 'PENDING'",
@@ -231,12 +240,22 @@ _V2_COLUMNS: dict[str, dict[str, str]] = {
         "error_summary": "TEXT NOT NULL DEFAULT ''",
         "succeeded": "INTEGER NOT NULL DEFAULT 0",
     },
+    # schema v3: 人間回答を元の質問者へ返すための列 (instruction-006 §5)。
+    # answered_at / answered_by / resulting_knowledge_id は v1 から存在するため
+    # 重複追加しない。
+    "pending_questions": {
+        "answer_text": "TEXT",
+        "answer_type": "TEXT NOT NULL DEFAULT 'HUMAN'",
+        "delivery_status": "TEXT NOT NULL DEFAULT 'UNDELIVERED'",
+        "delivered_at": "TEXT",
+        "updated_at": "TEXT",
+    },
 }
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """既存DBを最新スキーマへ引き上げる(冪等)。"""
-    for table, columns in _V2_COLUMNS.items():
+    for table, columns in _ADDED_COLUMNS.items():
         existing = {
             row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
         }
@@ -257,14 +276,50 @@ def _detect_fts5(conn: sqlite3.Connection) -> bool:
 
 
 def connect(settings: Settings | None = None) -> sqlite3.Connection:
+    """業務DBへ接続する。
+
+    2ターミナル運用(質問者と IT管理者が同じ `data/aifaq.db` を別プロセス
+    から使う, instruction-006 §6)を前提に、接続ごとに次を設定する。
+
+    - ``journal_mode=WAL``: 読み手(`watch` のポーリング)が書き手
+      (`pending answer`)をブロックしない。WALはDBファイルに永続する設定
+      なので毎回の指定は冪等だが、新規DBや他モードのDBでも確実に効くよう
+      接続時に必ず実行する。
+    - ``busy_timeout``: ロック競合時に即座に諦めず、SQLite側で待つ。
+      PRAGMAは**接続ごと**の設定なので、接続を作るこの場所で必ず設定する。
+    - ``synchronous=NORMAL``: WAL利用時の推奨値。耐久性を保ちつつ
+      書き込みのたびのfsyncを減らし、ロック保持時間を短くする。
+    """
     settings = settings or Settings.from_env()
     db_path = Path(settings.db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn = sqlite3.connect(
+        str(db_path),
+        check_same_thread=False,
+        # Pythonの暗黙BEGINを避け、`with conn:` の範囲だけを書き込み
+        # トランザクションにする。読み取りは自動コミットのまま短く終わるため、
+        # watch のポーリングが書き手を待たせない。
+        isolation_level="DEFERRED",
+    )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.OperationalError:
+        # WAL非対応のファイルシステム(一部のネットワークドライブ)でも
+        # 動作は継続する。既定のjournal_modeのままロック競合に備える。
+        pass
+    conn.execute(f"PRAGMA busy_timeout={int(settings.busy_timeout_ms)}")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def is_lock_error(exc: BaseException) -> bool:
+    """SQLiteのロック競合由来のエラーかどうかを判定する。"""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 def init_db(conn: sqlite3.Connection) -> bool:
@@ -287,6 +342,39 @@ def init_db(conn: sqlite3.Connection) -> bool:
             ("1" if fts5_available else "0",),
         )
     return fts5_available
+
+
+class DatabaseBusyError(RuntimeError):
+    """ロック競合が再試行上限まで解消しなかったことを表す。
+
+    生の「database is locked」ではなく、利用者が次に何をすればよいか
+    分かる形で扱うために独自の例外にする (instruction-006 §6)。
+    """
+
+
+def with_lock_retry(operation, *, attempts: int = 5, base_delay: float = 0.1):
+    """ロック競合時に限り、上限付きで再試行する。
+
+    `busy_timeout` でSQLite側も待つが、WALでも書き込みが重なると
+    `database is locked` が返ることがあるため、アプリ側でも短い指数
+    バックオフで再試行する。**無限には再試行しない** (§6)。
+    ロック以外のエラーは再試行せずそのまま送出する。
+    """
+    last_exc: sqlite3.OperationalError | None = None
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if not is_lock_error(exc):
+                raise
+            last_exc = exc
+            if attempt == attempts - 1:
+                break
+            time.sleep(base_delay * (2**attempt))
+    raise DatabaseBusyError(
+        f"データベースがロックされています(再試行{attempts}回)。"
+        "他の aifaq プロセスの処理が終わってから再実行してください。"
+    ) from last_exc
 
 
 def fts5_available(conn: sqlite3.Connection) -> bool:

@@ -1,91 +1,114 @@
-# 引き継ぎメモ (2026-08-06 instruction-005 完了時点)
+# 引き継ぎメモ (2026-08-06 instruction-006 完了時点)
 
 ## 現在の状態
 
-- `instruction-2026-08-06-005.md`(Antigravity移行)の実装は完了し、
+- `instruction-2026-08-06-006.md`(人間回答ループの完成)の実装は完了し、
   `origin/main` へpush済みです。
-- 判定: `SUCCESS_WITH_LIMITATIONS`(詳細は `result-2026-08-06-005.md`)
-- テスト: `python -m pytest -q` → **193 passed**、全体カバレッジ **90%**
+- 判定: `SUCCESS_WITH_LIMITATIONS`(詳細は `result-2026-08-06-006.md`)
+- テスト: `python -m pytest -q` → **242 passed**、全体カバレッジ **91%**
   (Python 3.12.10 / 3.13.1 の両方で確認済み)
-- 実Antigravity(`agy`)によるWeb調査の**成功パスを実機で確認済み**。
+- 2ターミナルでの人間回答ループを実機で確認済み(回答から3.2秒でwatchが検知)
 
-## 何が動くか
+## 何が動くか(2ターミナル運用)
+
+同じフォルダで2つのターミナルを開きます。
 
 ```bash
-python -m venv .venv && .venv\Scripts\activate
-pip install -e ".[dev]"
-python -m aifaq doctor
-python -m aifaq init
-python -m aifaq knowledge import --actor 名前
-python -m aifaq ask "Windows 11でネットワークアダプターを再起動する公式手順は？"
-python -m aifaq research list
-python -m aifaq research approve 1 --approved-by 名前
+# ターミナルA(質問者)
+aifaq ask "社内のPC交換申請先を教えてください" --thread-id demo-001 --requester 山田
+aifaq watch demo-001 --interval 1 --timeout 120
+
+# ターミナルB(IT管理者)
+aifaq pending list
+echo "PC交換申請はIT管理担当へ提出してください。" | \
+  aifaq pending answer 1 --approved-by hantani --category procedure
+
+# ターミナルA(後から確認する場合)
+aifaq status demo-001
 ```
 
-`--fake-provider` を付けるか `AIFAQ_RESEARCH_PROVIDER=fake` を設定すると、
-実AI CLIを呼ばずに動かせます。
+対話モード:
 
-## 004からの主な変更
+```bash
+aifaq chat --requester 山田      # /status で状態確認、/quit で終了
+```
 
-- Gemini CLI → **Antigravity CLI (`agy`)** へ移行。
-  呼び出しは `agy --print "<調査指示>" --output-format json`。
-- 環境変数は `AIFAQ_RESEARCH_*` へ統一(`AIFAQ_GEMINI_BIN` は非推奨警告)。
-- `aifaq research list/show/approve/reject` を追加。
-- `source_import_runs` の実書き込み、DBスキーマv2(冪等マイグレーション付き)。
-- GitHub Actions CI(Python 3.12 / 3.13、FakeProvider固定)。
-- **検索の不具合を修正**(下記)。
+実機試験は本番知識を汚さないよう専用DBで:
+
+```bash
+AIFAQ_DB_PATH=data/test.db aifaq ask "テスト質問" --thread-id t-001
+```
+
+## 005からの主な変更
+
+- `aifaq status` / `aifaq watch` / `aifaq chat` を追加。
+- `pending answer` が**元のpendingへ回答本文・回答者・回答日時を保存**し、
+  元のthread_idへ紐付けて `query_history` へ記録するようになった。
+- DBスキーマ v3(`pending_questions` に `answer_text` 等5列を冪等追加)。
+- SQLite: WAL・`busy_timeout`・`synchronous=NORMAL` を接続ごとに設定。
+  上限付き再試行(`db.with_lock_retry`)。
+- 回答本文の検証(空・長すぎ・制御文字を拒否)。
 
 ## 特に知っておくべき挙動
 
-1. **agyの `status: "ERROR"` は全体failureではない**。調査中に1件でも
-   ツール呼び出しが失敗すると、最終回答が完全でも `status=ERROR` になる。
-   本実装は本文が取れる限り回答を採用し、`error` を警告として添える。
-   `providers/antigravity.py` の `_extract_response_text` を参照。
-2. **検索は段階的フォールバック**。質問文全体のフレーズ検索 → 語のOR検索
-   (FTS5) → 語のLIKE検索 → 全体LIKE。語の抽出は
-   `util.extract_search_terms`(漢字・カタカナ・英数字を取り、ひらがなを
-   捨てる)。関連度は**必ず全検索語**に対して測ること(3文字以上の語だけで
-   測ると分母が縮んで過大評価され、無関係な資料を拾う)。
-3. **`routing.decide_route` の順序は安全上重要**。
-   承認済み知識 → **引き継ぎ判定** → 取り込み資料 の順。
-   取り込み資料を先に見ると、機密質問が資料の偶然の一致で回答されてしまう
-   (実際に `knowledge/README.md` で発生し修正済み)。順序を変えないこと。
-4. **`knowledge/**/README.md` は取り込まない**(`ingestion.EXCLUDED_FILENAMES`)。
+1. **LangGraphのチェックポイントは進めていない**。業務状態はSQLite側が正で、
+   `status` / `watch` は `pending_questions` から回答を返す。理由は
+   `result-2026-08-06-006.md` の §5 とREADMEに記載。ここを変えるときは
+   必ずその理由を読むこと。
+2. **`watch` はポーリングのたびに接続を開き直す**。DBを長時間ロックしない
+   ため。進捗表示は**標準エラー**へ出す(`--json` の標準出力を壊さない)。
+3. **二重回答は `UPDATE ... WHERE id=? AND status='OPEN'` の更新件数で防ぐ**。
+   SELECTしてからUPDATEするだけでは、2ターミナルから同時実行されたときに
+   両方通ってしまう。別プロセス2つでの検証テストあり。
+4. **`AlreadyAnsweredError` は `ValueError` を継承している**。従来の
+   `answer()` が `ValueError` を投げていたため、既存呼び出し側との互換性を
+   保つ目的。
+5. **PowerShell の `echo ... | aifaq pending answer` は先頭にBOMを付ける**。
+   stdin読み込み時に除去している(除去しないと制御文字として拒否される)。
 
 ## 次にやること(優先度順)
 
-1. **note記事の作成**(instruction-005 §7)
-   - §7.1の作成条件はすべて満たしているが、本セッションでは検索・
-     ルーティング修正の検証を優先したため未作成。
-   - `note/README.md` と `note/learning-ai-faq-for-beginners.md` を作成する。
-     構成は §7.3 / §7.4 をそのまま使える。
-   - 実際に確認できていない機能を「動いた」と書かないこと(§7.5)。
+1. **未登録の言い換えでの知識再利用**(未達事項、要判断)
+   - 現状: 完全一致と `--variants` 登録済みの別表現は再利用される。
+     未登録の言い換え(例「PC交換の申請先はどこですか」)はスコア0.500で
+     閾値0.55に届かず、確認質問へ進む。
+   - これは005で意図的に入れた安全側の設計(曖昧な一致で人間引き継ぎを
+     飛ばさないため)。緩めると005のセキュリティ修正を巻き戻す恐れがある。
+   - 案: 語のOR一致スコアを一致率に応じて可変にし、一致率が高いときだけ
+     閾値を超えるようにする。**利用者の判断を仰いでから着手すること。**
 
-2. **参照渡し(`AIFAQ_RESEARCH_TRANSPORT=file`)の実機検証**
-   - agyのヘッドレス実行は `read_file` を自動拒否する。
+2. **note記事の作成**(instruction-006 §12 / 005 §7)
+   - §12の条件は満たしているが、上記1の未達があるため見送った。
+   - 記事化に使える実機結果:
+     - 2ターミナルの人間回答ループ(watchが3.2秒で検知)
+     - `agy` による出典付きWeb調査の成功
+     - 機密質問で外部Providerが呼ばれない(`research_runs` が0件)
+     - Excel/CSV/Markdownの出典表示(シート名・見出し・行範囲)
+   - コマンド例と失敗例はREADMEの「2ターミナルでの使い方」がそのまま使える。
+   - スクリーンショット候補: ターミナルAのwatch待機中→回答表示の瞬間、
+     `aifaq status` の出力、`aifaq chat` の対話。
+
+3. **薄いWeb UI**
+   - 業務ロジックはサービス層(`graph.run_ask` / `run_reply`、
+     `repositories.thread_status`)にあり、CLIは薄い呼び出し。
+     Web UIからも同じ層をそのまま使える。
+   - 認証は必須(現CLIには無い。READMEの「認証なしCLI版の利用範囲」参照)。
+
+4. **参照渡し(`AIFAQ_RESEARCH_TRANSPORT=file`)の実機検証**
+   - agyのヘッドレス実行が `read_file` を自動拒否する。
      `C:\Users\garyo\.gemini\antigravity-cli\settings.json` に
-     `permissions.allow` を追加すれば検証できる見込み。
-   - 利用者のagy全体設定を変更する判断が必要なため今回は未実施。
-
-3. **検索の関連度閾値の再評価**
-   - `util._MIN_RELEVANCE_RATIO = 0.4` は手元の事例だけで決めた値。
-     実データを増やして再調整する。
-
-4. **薄いWeb UI**(instruction-005 §6の次段階)
-   - 既存サービス層(`graph.run_ask` / `run_reply`、`repositories`)を
-     そのまま呼ぶ形で追加する。
+     `permissions.allow` を追加すれば検証できる見込み(利用者の判断が必要)。
 
 ## 参照ファイル
 
-- 今回の詳細(実機確認内容・修正した不具合): `result-2026-08-06-005.md`
-- 使い方・アーキテクチャ・セキュリティ境界: `README.md`
+- 今回の詳細: `result-2026-08-06-006.md`
+- 前回(Antigravity移行・検索修正): `result-2026-08-06-005.md`
+- 使い方・2ターミナル運用・セキュリティ境界: `README.md`
 - 作業中の気づき: `dream.md`
-- 前回の結果: `result-2026-08-06-004.md`
 
 ## 注意事項
 
 - `knowledge/internal/` 等の実データと `data/` はGit管理対象外です。
 - コマンド実行はリポジトリ直下(`C:\project\AI-FAQ`)から行ってください。
-- `agy` は作業中に 1.1.9 → 1.1.10 へ自動更新されました。バージョンにより
-  `--output-format` の有無が変わるため、挙動が変わったら
-  `agy --help` を先に確認してください。
+- `tests/test_two_terminal_integration.py` は別プロセス起動を伴うため、
+  実行に1分程度かかります。

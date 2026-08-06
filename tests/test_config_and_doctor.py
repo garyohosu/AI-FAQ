@@ -210,6 +210,115 @@ def test_v1_database_is_migrated_in_place(tmp_path):
     conn.close()
 
 
+def test_v2_database_gains_v3_pending_columns_without_data_loss(tmp_path):
+    """既存DBを削除せず、pending_questions へ v3 の列を追加できる。
+
+    instruction-006 §5「既存の data/aifaq.db を壊さない」の検証。
+    """
+    from aifaq import db as db_module
+    from aifaq.repositories import Repositories
+
+    db_path = tmp_path / "v2.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    # v1/v2 相当の pending_questions (v3 の列は無い)
+    conn.executescript(
+        """
+        CREATE TABLE knowledge_articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical_question TEXT NOT NULL,
+            canonical_question_norm TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'other',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'DRAFT',
+            source_type TEXT NOT NULL DEFAULT 'HUMAN',
+            version INTEGER NOT NULL DEFAULT 1,
+            approved_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            valid_until TEXT,
+            source_urls_json TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE TABLE pending_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            original_question TEXT NOT NULL,
+            classification_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            created_at TEXT NOT NULL,
+            answered_at TEXT,
+            answered_by TEXT,
+            resulting_knowledge_id INTEGER
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO pending_questions "
+        "(thread_id, question, original_question, created_at) "
+        "VALUES ('old-thread', 'q', '旧DBの質問', '2026-01-01T00:00:00Z')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = db_module.connect(Settings(db_path=db_path))
+    db_module.init_db(conn)
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(pending_questions)")}
+        assert {
+            "answer_text", "answer_type", "delivery_status", "delivered_at", "updated_at"
+        } <= cols
+        # 既存の列を重複追加していない
+        assert len([c for c in cols if c == "answered_by"]) == 1
+
+        # 既存行は残る
+        row = conn.execute("SELECT * FROM pending_questions WHERE id=1").fetchone()
+        assert row["original_question"] == "旧DBの質問"
+        assert row["status"] == "OPEN"
+        assert row["answer_text"] is None
+        assert row["delivery_status"] == "UNDELIVERED"
+
+        # 旧DBの pending にそのまま回答でき、status も取れる
+        repos = Repositories.build(conn)
+        repos.pending.answer(
+            1, answer_text="移行後に登録した回答", category="other",
+            tags=[], variants=[], approved_by="hantani",
+        )
+        status = repos.thread_status(thread_id="old-thread")
+        assert status.state.value == "ANSWERED"
+        assert status.answer == "移行後に登録した回答"
+    finally:
+        conn.close()
+
+
+def test_migration_is_idempotent_across_repeated_init(tmp_path):
+    """init_db を繰り返しても既存データを壊さない。"""
+    from aifaq import db as db_module
+    from aifaq.repositories import Repositories
+
+    settings = Settings(db_path=tmp_path / "repeat.db")
+    conn = db_module.connect(settings)
+    db_module.init_db(conn)
+    pid = Repositories.build(conn).pending.create(
+        thread_id="t", question="q", original_question="q", classification={}
+    )
+    conn.close()
+
+    for _ in range(3):
+        conn = db_module.connect(settings)
+        db_module.init_db(conn)
+        conn.close()
+
+    conn = db_module.connect(settings)
+    try:
+        row = conn.execute("SELECT * FROM pending_questions WHERE id=?", (pid,)).fetchone()
+        assert row is not None
+        assert row["status"] == "OPEN"
+    finally:
+        conn.close()
+
+
 def test_init_db_is_idempotent(tmp_path):
     from aifaq import db as db_module
 
@@ -220,5 +329,5 @@ def test_init_db_is_idempotent(tmp_path):
     version = conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()["value"]
-    assert version == "2"
+    assert version == str(db_module.SCHEMA_VERSION)
     conn.close()

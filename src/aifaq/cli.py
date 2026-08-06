@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sqlite3
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -26,11 +27,14 @@ from aifaq.models import (
     SourcePriority,
     SourceScope,
     SourceStatus,
+    ThreadState,
+    ThreadStatus,
 )
 from aifaq.providers.antigravity import AntigravityProvider
 from aifaq.providers.base import ResearchProviderError
 from aifaq.providers.fake import FakeResearchProvider
-from aifaq.repositories import Repositories
+from aifaq.repositories import AlreadyAnsweredError, Repositories
+from aifaq.security import AnswerValidationError, validate_human_answer
 
 
 def _repo_root() -> Path:
@@ -69,13 +73,22 @@ def _format_answer(ans, max_rounds: int) -> str:
         return "\n".join(lines)
     if ans.answer_type == AnswerType.PENDING_HUMAN:
         lines = [
-            "[IT管理者の回答待ち]",
+            "IT管理者へ引き継ぎました。",
             ans.answer,
             f"受付番号: {ans.pending_id}",
             f"thread_id: {ans.thread_id}",
+            "状態: 回答待ち",
         ]
         if ans.notice:
             lines.append(f"理由: {ans.notice}")
+        lines += [
+            "",
+            "後から次のコマンドで確認できます:",
+            f"  aifaq status {ans.thread_id}",
+            "",
+            "回答を待ち続ける場合:",
+            f"  aifaq watch {ans.thread_id}",
+        ]
         return "\n".join(lines)
     if ans.answer_type == AnswerType.NEEDS_CLARIFICATION:
         lines = [
@@ -342,26 +355,238 @@ def cmd_pending_answer(args, settings: Settings) -> int:
             # utf-8-sig: Windows のエディタが付けるBOMを回答本文へ混入させない
             answer_text = Path(args.answer_file).read_text(encoding="utf-8-sig").strip()
         else:
-            answer_text = sys.stdin.read().strip()
+            # PowerShell の `echo ... | aifaq ...` は先頭にBOM(U+FEFF)を
+            # 付けることがある。ファイル読み込み側と同じ扱いで取り除く。
+            answer_text = sys.stdin.read().lstrip("﻿").strip()
         if not answer_text:
             print("回答本文が空です(--answer-fileまたは標準入力で指定してください)")
             return 2
+        try:
+            answer_text = validate_human_answer(
+                answer_text, max_chars=settings.max_answer_chars
+            )
+        except AnswerValidationError as exc:
+            print(f"エラー: {exc}", file=sys.stderr)
+            return 2
+
         tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
         variants = [v.strip() for v in (args.variants or "").split(",") if v.strip()]
-        knowledge_id = repos.pending.answer(
-            args.id,
-            answer_text=answer_text,
-            category=args.category,
-            tags=tags,
-            variants=variants,
-            approved_by=args.approved_by,
-            valid_until=args.valid_until,
-            change_reason=args.reason or "IT管理者による人間回答",
-        )
-        print(f"承認済み知識として保存しました: KB-{knowledge_id} (pending #{args.id} ANSWERED)")
+        try:
+            knowledge_id = repos.pending.answer(
+                args.id,
+                answer_text=answer_text,
+                category=args.category,
+                tags=tags,
+                variants=variants,
+                approved_by=args.approved_by,
+                valid_until=args.valid_until,
+                change_reason=args.reason or "IT管理者による人間回答",
+            )
+        except AlreadyAnsweredError as exc:
+            # 既存回答は上書きしない (§4.3)。
+            print(f"エラー: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"エラー: {exc}", file=sys.stderr)
+            return 1
+
+        pending = repos.pending.get(args.id)
+        thread_id = pending["thread_id"] if pending else ""
+        if args.json:
+            _print(
+                {
+                    "pending_id": args.id,
+                    "thread_id": thread_id,
+                    "knowledge_id": knowledge_id,
+                    "status": "ANSWERED",
+                },
+                True,
+            )
+        else:
+            print(
+                f"承認済み知識として保存しました: KB-{knowledge_id} "
+                f"(pending #{args.id} ANSWERED)"
+            )
+            print(f"質問者のthread_id: {thread_id}")
+            print(f"質問者は次で受け取れます: aifaq status {thread_id}")
         return 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# status / watch (instruction-006 §4.1 / §4.2)
+# ---------------------------------------------------------------------------
+
+#: `watch` がタイムアウトしたときの終了コード。READMEに記載する。
+WATCH_TIMEOUT_EXIT_CODE = 3
+#: `watch` / `status` の対象が見つからないときの終了コード。
+NOT_FOUND_EXIT_CODE = 1
+#: Ctrl+C で中断したときの終了コード。
+INTERRUPTED_EXIT_CODE = 130
+
+
+def _format_status(status: ThreadStatus) -> str:
+    """`status` / `watch` の人間向け表示。"""
+    if status.state == ThreadState.NOT_FOUND:
+        return f"該当する質問が見つかりません: {status.thread_id or '(指定なし)'}"
+
+    lines: list[str] = []
+    if status.state == ThreadState.ANSWERED:
+        lines.append("[IT管理者からの回答]")
+        lines.append(status.answer or "(回答本文が記録されていません)")
+        lines.append("")
+    elif status.state == ThreadState.PENDING_HUMAN:
+        lines.append("[回答待ち]")
+    elif status.state == ThreadState.NEEDS_CLARIFICATION:
+        lines.append("[確認質問に回答してください]")
+        if status.next_question:
+            lines.append(status.next_question)
+        if status.options:
+            lines.append("選択肢: " + " / ".join(status.options))
+        lines.append("")
+    elif status.state == ThreadState.CANCELLED:
+        lines.append("[取り下げ済み]")
+    elif status.state == ThreadState.COMPLETED:
+        lines.append("[対応済み(人間引き継ぎなし)]")
+
+    if status.pending_id is not None:
+        lines.append(f"受付番号: {status.pending_id}")
+    lines.append(f"thread_id: {status.thread_id}")
+    if status.original_question:
+        lines.append(f"質問: {status.original_question}")
+    if status.state != ThreadState.ANSWERED:
+        lines.append(f"状態: {status.state.value}")
+    if status.created_at:
+        lines.append(f"受付日時: {status.created_at.isoformat()}")
+    if status.answered_by:
+        lines.append(f"回答者: {status.answered_by}")
+    if status.answered_at:
+        lines.append(f"回答日時: {status.answered_at.isoformat()}")
+    if status.answer_type:
+        lines.append(f"回答種別: {status.answer_type}")
+    if status.knowledge_id:
+        lines.append(f"承認済み知識: KB-{status.knowledge_id}")
+    if status.sources:
+        lines.append("出典:")
+        lines += [f"- {s.url}" for s in status.sources]
+    if status.clarifications:
+        lines.append("確認質問履歴:")
+        for c in status.clarifications:
+            lines.append(f"  round{c.round_no}: Q={c.question} A={c.answer or '(未回答)'}")
+    return "\n".join(lines)
+
+
+def _lookup_status(repos, args) -> ThreadStatus:
+    pending_id = getattr(args, "pending_id", None)
+    thread_id = getattr(args, "thread_id", None)
+    return repos.thread_status(thread_id=thread_id, pending_id=pending_id)
+
+
+def cmd_status(args, settings: Settings) -> int:
+    if not args.thread_id and args.pending_id is None:
+        print("thread_id または --pending-id を指定してください", file=sys.stderr)
+        return 2
+    conn, repos = _open(settings)
+    try:
+        status = _lookup_status(repos, args)
+        if status.state == ThreadState.ANSWERED and status.pending_id is not None:
+            # 受領は記録するが状態は壊さない (§7)。
+            repos.pending.mark_delivered(status.pending_id)
+            status = _lookup_status(repos, args)
+        if args.json:
+            _print(status, True)
+        else:
+            print(_format_status(status))
+        return NOT_FOUND_EXIT_CODE if status.state == ThreadState.NOT_FOUND else 0
+    finally:
+        conn.close()
+
+
+def cmd_watch(args, settings: Settings) -> int:
+    """回答が入るまでSQLiteをポーリングする。
+
+    ポーリングのたびに接続を開き直し、短い読み取りで閉じる。`watch` が
+    DBを長時間ロックしないようにするため (instruction-006 §6)。
+    """
+    if not args.thread_id and args.pending_id is None:
+        print("thread_id または --pending-id を指定してください", file=sys.stderr)
+        return 2
+
+    interval = args.interval if args.interval is not None else settings.watch_interval_seconds
+    if interval < settings.watch_min_interval_seconds:
+        print(
+            f"エラー: --interval は {settings.watch_min_interval_seconds} 秒以上に"
+            f"してください(指定値: {interval})",
+            file=sys.stderr,
+        )
+        return 2
+
+    deadline = None if args.timeout is None else time.monotonic() + args.timeout
+    last_state: ThreadState | None = None
+    #: 進捗表示は stderr へ出す。`--json` の標準出力を壊さないため (§4.2)。
+    progress = sys.stderr
+
+    try:
+        while True:
+            conn, repos = _open(settings)
+            try:
+                status = _lookup_status(repos, args)
+                if status.state == ThreadState.NOT_FOUND:
+                    if args.json:
+                        _print(status, True)
+                    else:
+                        print(_format_status(status))
+                    return NOT_FOUND_EXIT_CODE
+                if status.is_final:
+                    if status.state == ThreadState.ANSWERED and status.pending_id is not None:
+                        repos.pending.mark_delivered(status.pending_id)
+                        status = _lookup_status(repos, args)
+                    if args.json:
+                        _print(status, True)
+                    else:
+                        print(_format_status(status))
+                    return 0
+            finally:
+                conn.close()
+
+            # 状態が変わったときだけ表示し、待機中に大量出力しない (§4.2)。
+            if status.state != last_state:
+                last_state = status.state
+                if not args.json:
+                    print(
+                        f"待機中... (状態: {status.state.value}, "
+                        f"{interval}秒ごとに確認。Ctrl+Cで終了)",
+                        file=progress,
+                    )
+
+            if deadline is not None and time.monotonic() + interval > deadline:
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining > 0:
+                    time.sleep(remaining)
+                conn, repos = _open(settings)
+                try:
+                    status = _lookup_status(repos, args)
+                finally:
+                    conn.close()
+                if status.is_final:
+                    if args.json:
+                        _print(status, True)
+                    else:
+                        print(_format_status(status))
+                    return 0
+                if args.json:
+                    _print(status, True)
+                else:
+                    print(f"タイムアウトしました({args.timeout}秒)。")
+                    print(_format_status(status))
+                return WATCH_TIMEOUT_EXIT_CODE
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        # Ctrl+C は異常終了ではなく「待つのをやめた」だけ。状態は壊さない。
+        print("\n待機を中止しました(回答はDBに残ります)。", file=progress)
+        return INTERRUPTED_EXIT_CODE
 
 
 def cmd_knowledge_import(args, settings: Settings) -> int:
@@ -642,6 +867,117 @@ def cmd_memory_sync(args, settings: Settings) -> int:
 
 
 # ---------------------------------------------------------------------------
+# chat: 対話モード (instruction-006 §4.4)
+# ---------------------------------------------------------------------------
+
+_CHAT_BANNER = """AI-FAQ CLI
+終了: /quit
+状態確認: /status
+"""
+
+
+def cmd_chat(args, settings: Settings) -> int:
+    """確認質問を繰り返す対話モード。
+
+    FAQロジックは重複実装せず、既存の `run_ask` / `run_reply` をそのまま
+    呼ぶ。確認質問の最大3回制限も既存のグラフ側の制御に従う。
+    """
+    thread_id = args.thread_id or str(uuid.uuid4())
+    print(_CHAT_BANNER)
+    print(f"thread_id: {thread_id}\n")
+
+    conn, repos = _open(settings)
+    try:
+        provider = _get_provider(settings, args.fake_provider)
+        awaiting_clarification = False
+
+        while True:
+            try:
+                line = input("あなた> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n終了します。")
+                return 0
+
+            if not line:
+                continue
+            if line in ("/quit", "/exit"):
+                print("終了します。")
+                return 0
+            if line == "/status":
+                status = repos.thread_status(thread_id=thread_id)
+                print(_format_status(status))
+                print()
+                continue
+            if line.startswith("/"):
+                print("不明なコマンドです。使えるのは /status と /quit です。\n")
+                continue
+
+            try:
+                if awaiting_clarification:
+                    ans = run_reply(
+                        repos, settings, provider,
+                        thread_id=thread_id, answer_text=line,
+                    )
+                else:
+                    ans = run_ask(
+                        repos, settings, provider,
+                        thread_id=thread_id, question=line, requester=args.requester,
+                    )
+            except ReplyError as exc:
+                print(f"AI-FAQ> エラー: {exc}\n")
+                awaiting_clarification = False
+                continue
+
+            awaiting_clarification = ans.answer_type == AnswerType.NEEDS_CLARIFICATION
+
+            if awaiting_clarification:
+                print(f"AI-FAQ> {ans.question}")
+                for i, option in enumerate(ans.options, start=1):
+                    print(f"  {i}. {option}")
+                print()
+                continue
+
+            if ans.answer_type == AnswerType.PENDING_HUMAN:
+                print(f"AI-FAQ> IT管理者へ引き継ぎました。受付番号は{ans.pending_id}です。")
+                if not _chat_offer_wait(args, settings, thread_id):
+                    return 0
+                print()
+                continue
+
+            print(f"AI-FAQ> {ans.answer}")
+            if ans.sources:
+                for s in ans.sources:
+                    print(f"  出典: {s.url}")
+            if ans.notice:
+                print(f"  注意: {ans.notice}")
+            print()
+    finally:
+        conn.close()
+
+
+def _chat_offer_wait(args, settings: Settings, thread_id: str) -> bool:
+    """人間回答待ちで、待機するか終了するかを選ばせる。
+
+    待機して回答を受け取った場合も、続けて質問できるよう True を返す。
+    利用者が終了を選んだ場合のみ False。
+    """
+    try:
+        choice = input("AI-FAQ> このまま回答を待ちますか？ [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if choice in ("n", "no"):
+        print(f"AI-FAQ> 後から次で確認できます: aifaq status {thread_id}")
+        return False
+
+    watch_args = argparse.Namespace(
+        thread_id=thread_id, pending_id=None, interval=None, timeout=None, json=False
+    )
+    cmd_watch(watch_args, settings)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # research: AI調査結果の人間承認 (instruction-005 §5.1)
 # ---------------------------------------------------------------------------
 
@@ -876,6 +1212,27 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("history")
     p.add_argument("thread_id")
     p.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("chat", help="確認質問を繰り返す対話モード")
+    p.add_argument("--requester")
+    p.add_argument("--thread-id")
+    p.set_defaults(func=cmd_chat)
+
+    p = sub.add_parser("status", help="質問スレッドの状態と回答を一度だけ確認する")
+    p.add_argument("thread_id", nargs="?")
+    p.add_argument("--pending-id", type=int, help="受付番号で検索する")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("watch", help="回答が入るまで待って表示する")
+    p.add_argument("thread_id", nargs="?")
+    p.add_argument("--pending-id", type=int, help="受付番号で検索する")
+    p.add_argument(
+        "--interval",
+        type=float,
+        help=f"ポーリング間隔(秒)。既定2.0、最短0.5",
+    )
+    p.add_argument("--timeout", type=float, help="待機の上限(秒)。省略時は無制限")
+    p.set_defaults(func=cmd_watch)
 
     research = sub.add_parser("research", help="AI調査結果の確認と承認")
     research_sub = research.add_subparsers(dest="research_command", required=True)
