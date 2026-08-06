@@ -406,10 +406,11 @@ class KnowledgeCitation(BaseModel):
             parts = [self.relative_path]
             if self.sheet_name:
                 parts.append(f'シート「{self.sheet_name}」')
+            elif self.heading:
+                # Markdown/TXTでは見出しがあると本文中の位置を追いやすい。
+                parts.append(f"見出し「{self.heading}」")
             if self.row_start is not None and self.row_end is not None:
                 parts.append(f"行{self.row_start}-{self.row_end}")
-            elif self.heading:
-                parts.append(f"見出し「{self.heading}」")
             return "参照: " + " / ".join(parts)
         if self.knowledge_id is not None:
             return f"参照: KB-{self.knowledge_id}"

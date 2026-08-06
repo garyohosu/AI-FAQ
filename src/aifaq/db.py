@@ -12,7 +12,7 @@ from pathlib import Path
 
 from aifaq.config import Settings
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS knowledge_articles (
@@ -87,7 +87,16 @@ CREATE TABLE IF NOT EXISTS research_runs (
     warnings_json TEXT NOT NULL DEFAULT '[]',
     error_summary TEXT,
     started_at TEXT NOT NULL,
-    finished_at TEXT
+    finished_at TEXT,
+    -- schema v2: AI調査結果の人間承認 (instruction-005 §5.1)
+    answer TEXT NOT NULL DEFAULT '',
+    review_status TEXT NOT NULL DEFAULT 'PENDING',
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    review_reason TEXT NOT NULL DEFAULT '',
+    was_modified INTEGER NOT NULL DEFAULT 0,
+    approved_answer TEXT,
+    resulting_knowledge_id INTEGER REFERENCES knowledge_articles(id)
 );
 
 CREATE TABLE IF NOT EXISTS clarification_turns (
@@ -142,7 +151,16 @@ CREATE TABLE IF NOT EXISTS source_import_runs (
     imported INTEGER NOT NULL DEFAULT 0,
     skipped_unchanged INTEGER NOT NULL DEFAULT 0,
     failed INTEGER NOT NULL DEFAULT 0,
-    warnings_json TEXT NOT NULL DEFAULT '[]'
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    -- schema v2: 取り込み単位の記録 (instruction-005 §5.2)
+    target_path TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    detected INTEGER NOT NULL DEFAULT 0,
+    added INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER NOT NULL DEFAULT 0,
+    missing INTEGER NOT NULL DEFAULT 0,
+    error_summary TEXT NOT NULL DEFAULT '',
+    succeeded INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS memory_entries (
@@ -187,6 +205,48 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 # フォールバックする)。
 
 
+#: schema v1 で作られた既存DBへ後から足す列。
+#: ``CREATE TABLE IF NOT EXISTS`` は既存テーブルの列を増やさないため、
+#: ``ALTER TABLE ... ADD COLUMN`` で冪等に追加する。
+#: SQLite の ADD COLUMN は非定数 DEFAULT と REFERENCES 付き NOT NULL を
+#: 受け付けないので、ここでは定数 DEFAULT または NULL 許容のみを使う。
+_V2_COLUMNS: dict[str, dict[str, str]] = {
+    "research_runs": {
+        "answer": "TEXT NOT NULL DEFAULT ''",
+        "review_status": "TEXT NOT NULL DEFAULT 'PENDING'",
+        "reviewed_by": "TEXT",
+        "reviewed_at": "TEXT",
+        "review_reason": "TEXT NOT NULL DEFAULT ''",
+        "was_modified": "INTEGER NOT NULL DEFAULT 0",
+        "approved_answer": "TEXT",
+        "resulting_knowledge_id": "INTEGER",
+    },
+    "source_import_runs": {
+        "target_path": "TEXT NOT NULL DEFAULT ''",
+        "actor": "TEXT NOT NULL DEFAULT ''",
+        "detected": "INTEGER NOT NULL DEFAULT 0",
+        "added": "INTEGER NOT NULL DEFAULT 0",
+        "updated": "INTEGER NOT NULL DEFAULT 0",
+        "missing": "INTEGER NOT NULL DEFAULT 0",
+        "error_summary": "TEXT NOT NULL DEFAULT ''",
+        "succeeded": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """既存DBを最新スキーマへ引き上げる(冪等)。"""
+    for table, columns in _V2_COLUMNS.items():
+        existing = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if not existing:
+            continue  # テーブル自体が未作成なら _TABLES_SQL 側で作られる
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def _detect_fts5(conn: sqlite3.Connection) -> bool:
     try:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_probe USING fts5(x)")
@@ -211,6 +271,7 @@ def init_db(conn: sqlite3.Connection) -> bool:
     """テーブルを冪等に初期化する。FTS5が使えたかどうかを返す。"""
     with conn:
         conn.executescript(_TABLES_SQL)
+        _migrate(conn)
         fts5_available = _detect_fts5(conn)
         if fts5_available:
             conn.executescript(_FTS_SQL)

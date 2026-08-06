@@ -207,14 +207,17 @@ def decide_route(state: dict, settings: Settings) -> RouteDecision:
             route="human", reason="複数の優先資料が矛盾しているため人間判断が必要"
         )
 
+    # 人間が承認した知識は、機密性の高い質問にも回答してよい
+    # (「パスワードは電話では回答できません」のような回答自体が承認済みの
+    #  運用ルールであるため)。これが学習ループの成果物にあたる。
     match = best_knowledge_match(knowledge_matches, settings.knowledge_match_threshold)
     if match is not None:
         return RouteDecision(route="knowledge", reason="承認済み知識で回答可能")
 
-    chunk = best_source_chunk(source_chunks)
-    if chunk is not None:
-        return RouteDecision(route="knowledge", reason="取り込み済み資料で回答可能")
-
+    # 取り込み済み資料より先に引き継ぎ判定を行う。
+    # 取り込み資料は人手で回答として承認されたものではなく、ファイルの中身を
+    # そのまま返すだけなので、機密性の高い質問・人間対応の希望・行き詰まりを
+    # 資料の偶然の一致で握りつぶしてはならない。
     escalate_reason = check_escalation(
         classification=classification,
         clarification_history=clarification_history,
@@ -222,6 +225,10 @@ def decide_route(state: dict, settings: Settings) -> RouteDecision:
     )
     if escalate_reason:
         return RouteDecision(route="human", reason=escalate_reason, escalate_reason=escalate_reason)
+
+    chunk = best_source_chunk(source_chunks)
+    if chunk is not None:
+        return RouteDecision(route="knowledge", reason="取り込み済み資料で回答可能")
 
     scope = classification.get("scope")
     safe_external = bool(classification.get("safe_for_external_research"))

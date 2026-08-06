@@ -16,18 +16,20 @@ import uuid
 from pathlib import Path
 
 from aifaq import db, ingestion, memory
-from aifaq.config import Settings
+from aifaq.config import PROVIDER_FAKE, Settings
 from aifaq.graph import ReplyError, run_ask, run_reply
 from aifaq.models import (
     AnswerType,
+    KnowledgeSourceType,
     KnowledgeStatus,
     PendingStatus,
     SourcePriority,
     SourceScope,
     SourceStatus,
 )
+from aifaq.providers.antigravity import AntigravityProvider
+from aifaq.providers.base import ResearchProviderError
 from aifaq.providers.fake import FakeResearchProvider
-from aifaq.providers.gemini_cli import GeminiCLIProvider
 from aifaq.repositories import Repositories
 
 
@@ -89,10 +91,34 @@ def _format_answer(ans, max_rounds: int) -> str:
     return ans.answer
 
 
+def _format_citation(chunk) -> str:
+    """取り込み資料の出典表記を組み立てる。
+
+    instruction-005 §4.6 が求めるとおり、ファイル・Excelシート名・行範囲を
+    すべて示す。シート名を持たないMarkdown/TXTでは見出しがあれば見出しを使う。
+    """
+    parts = [chunk["relative_path"]]
+    sheet = chunk["sheet_name"] if "sheet_name" in chunk.keys() else None
+    if sheet:
+        parts.append(f"シート「{sheet}」")
+    row_start, row_end = chunk["row_start"], chunk["row_end"]
+    if row_start is not None and row_end is not None:
+        parts.append(f"行{row_start}-{row_end}" if row_start != row_end else f"行{row_start}")
+    heading = chunk["heading"] if "heading" in chunk.keys() else None
+    if not sheet and heading:
+        parts.append(f"見出し「{heading}」")
+    return " ".join(parts)
+
+
 def _get_provider(settings: Settings, use_fake: bool):
-    if use_fake:
+    """調査プロバイダーを決める。
+
+    `--fake-provider` が最優先、次に `AIFAQ_RESEARCH_PROVIDER=fake`。
+    どちらも指定が無ければ実環境用の Antigravity CLI を使う。
+    """
+    if use_fake or settings.research_provider == PROVIDER_FAKE:
         return FakeResearchProvider()
-    return GeminiCLIProvider(settings)
+    return AntigravityProvider(settings)
 
 
 # ---------------------------------------------------------------------------
@@ -127,62 +153,59 @@ def _doctor_checks(settings: Settings, repo_root: Path) -> list[dict]:
     except Exception as exc:  # noqa: BLE001
         checks.append({"name": "db_writable", "status": "error", "detail": str(exc)})
 
-    gemini_path = shutil.which(settings.gemini_executable)
-    if gemini_path is None:
+    checks.append(
+        {
+            "name": "research_provider",
+            "status": "ok",
+            "detail": f"{settings.research_provider} (transport={settings.research_transport})",
+        }
+    )
+
+    if settings.research_provider == PROVIDER_FAKE:
         checks.append(
-            {"name": "gemini_cli_present", "status": "warn", "detail": "見つかりません"}
+            {
+                "name": "antigravity_cli_present",
+                "status": "ok",
+                "detail": "FakeProvider を使用中のため未確認",
+            }
         )
     else:
-        checks.append({"name": "gemini_cli_present", "status": "ok", "detail": gemini_path})
-        try:
-            proc = subprocess.run(
-                [gemini_path, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                shell=False,
-                check=False,
-            )
+        agy_path = shutil.which(settings.research_bin)
+        if agy_path is None:
             checks.append(
                 {
-                    "name": "gemini_cli_version",
-                    "status": "ok" if proc.returncode == 0 else "warn",
-                    "detail": (proc.stdout or proc.stderr).strip()[:200],
+                    "name": "antigravity_cli_present",
+                    "status": "warn",
+                    "detail": f"{settings.research_bin!r} が見つかりません",
                 }
             )
-        except Exception as exc:  # noqa: BLE001
-            checks.append({"name": "gemini_cli_version", "status": "warn", "detail": str(exc)})
-
-    gemini_settings_path = repo_root / ".gemini" / "settings.json"
-    if gemini_settings_path.exists():
-        checks.append(
-            {"name": "gemini_settings_present", "status": "ok", "detail": str(gemini_settings_path)}
-        )
-        try:
-            data = json.loads(gemini_settings_path.read_text(encoding="utf-8"))
-            excluded = set(data.get("tools", {}).get("exclude", []))
-            dangerous = {"run_shell_command", "write_file", "edit", "replace", "save_memory"}
-            missing = dangerous - excluded
-            if missing:
-                checks.append(
-                    {
-                        "name": "gemini_dangerous_tools_disabled",
-                        "status": "warn",
-                        "detail": f"除外設定に無いツール: {sorted(missing)}",
-                    }
-                )
-            else:
-                checks.append(
-                    {"name": "gemini_dangerous_tools_disabled", "status": "ok", "detail": "OK"}
-                )
-        except (json.JSONDecodeError, OSError) as exc:
+        else:
             checks.append(
-                {"name": "gemini_dangerous_tools_disabled", "status": "warn", "detail": str(exc)}
+                {"name": "antigravity_cli_present", "status": "ok", "detail": agy_path}
             )
-    else:
-        checks.append(
-            {"name": "gemini_settings_present", "status": "warn", "detail": "見つかりません"}
-        )
+            try:
+                version = AntigravityProvider(settings).version()
+                checks.append(
+                    {"name": "antigravity_cli_version", "status": "ok", "detail": version[:200]}
+                )
+            except ResearchProviderError as exc:
+                checks.append(
+                    {"name": "antigravity_cli_version", "status": "warn", "detail": str(exc)[:200]}
+                )
+
+        if settings.research_transport == "file":
+            # 参照渡しは agy 側の権限設定が要る。ヘッドレスでは read_file が
+            # 自動拒否されるため、既定の arg 方式より確認事項が多い。
+            checks.append(
+                {
+                    "name": "antigravity_transport_file_note",
+                    "status": "warn",
+                    "detail": (
+                        "transport=file は agy の permissions.allow へ read_file を "
+                        "許可する設定が必要です(未設定だとヘッドレスで自動拒否されます)"
+                    ),
+                }
+            )
 
     try:
         result = subprocess.run(
@@ -316,7 +339,8 @@ def cmd_pending_answer(args, settings: Settings) -> int:
     conn, repos = _open(settings)
     try:
         if args.answer_file:
-            answer_text = Path(args.answer_file).read_text(encoding="utf-8").strip()
+            # utf-8-sig: Windows のエディタが付けるBOMを回答本文へ混入させない
+            answer_text = Path(args.answer_file).read_text(encoding="utf-8-sig").strip()
         else:
             answer_text = sys.stdin.read().strip()
         if not answer_text:
@@ -342,6 +366,12 @@ def cmd_pending_answer(args, settings: Settings) -> int:
 
 def cmd_knowledge_import(args, settings: Settings) -> int:
     conn, repos = _open(settings)
+    # 取り込み単位を source_import_runs へ記録する (instruction-005 §5.2)。
+    # 失敗時も finish() を必ず呼び、途中終了した run を残さない。
+    run_id = repos.import_runs.start(
+        target_path=args.path or str(settings.knowledge_dir),
+        actor=getattr(args, "actor", None) or "cli",
+    )
     try:
         repo_root = _repo_root()
         result = validate_and_get_index(repo_root, settings)
@@ -376,10 +406,30 @@ def cmd_knowledge_import(args, settings: Settings) -> int:
                     )
                     repos.source_files.upsert(rec)
 
+        imported = [o for o in outcomes if o.status == "imported"]
+        failures = [o for o in outcomes if o.status == "failed"]
+        counts = {
+            "detected": len(outcomes),
+            "added": sum(1 for o in imported if not o.was_existing),
+            "updated": sum(1 for o in imported if o.was_existing),
+            "skipped_unchanged": sum(1 for o in outcomes if o.status == "skipped_unchanged"),
+            "missing": len(missing),
+            "failed": len(failures),
+        }
+        repos.import_runs.finish(
+            run_id,
+            **counts,
+            warnings=[w.message for o in outcomes for w in o.warnings],
+            error_summary="; ".join(f"{o.relative_path}: failed" for o in failures)[:500],
+            succeeded=not failures,
+        )
+
         if args.json:
             print(
                 json.dumps(
                     {
+                        "import_run_id": run_id,
+                        "counts": counts,
                         "outcomes": [
                             {
                                 "path": o.relative_path,
@@ -401,7 +451,18 @@ def cmd_knowledge_import(args, settings: Settings) -> int:
                     print(f"  警告: {w.message}")
             for m in missing:
                 print(f"欠落として記録: {m}")
+            print(
+                f"取り込み実行 #{run_id}: 検出{counts['detected']} "
+                f"追加{counts['added']} 更新{counts['updated']} "
+                f"不変{counts['skipped_unchanged']} 欠落{counts['missing']} "
+                f"失敗{counts['failed']}"
+            )
         return 0
+    except Exception as exc:  # noqa: BLE001 - 失敗も実行記録として残す
+        repos.import_runs.finish(
+            run_id, error_summary=str(exc)[:500], succeeded=False, failed=1
+        )
+        raise
     finally:
         conn.close()
 
@@ -442,7 +503,7 @@ def cmd_knowledge_search(args, settings: Settings) -> int:
                 print(f"KB-{m.knowledge_id} (score={m.score:.2f}): {m.canonical_question}")
             print("== 取り込み資料 ==")
             for c in chunks:
-                print(f"{c['relative_path']} 行{c['row_start']}-{c['row_end']}: {c['content'][:80]}")
+                print(f"{_format_citation(c)}: {c['content'][:80]}")
         return 0
     finally:
         conn.close()
@@ -580,6 +641,181 @@ def cmd_memory_sync(args, settings: Settings) -> int:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# research: AI調査結果の人間承認 (instruction-005 §5.1)
+# ---------------------------------------------------------------------------
+
+#: research run のレビュー状態。
+REVIEW_PENDING = "PENDING"
+REVIEW_APPROVED = "APPROVED"
+REVIEW_REJECTED = "REJECTED"
+REVIEW_EXPIRED = "EXPIRED"
+REVIEW_NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+def _research_row_to_dict(row) -> dict:
+    data = dict(row)
+    data["sources"] = json.loads(data.pop("sources_json", "[]") or "[]")
+    data["warnings"] = json.loads(data.pop("warnings_json", "[]") or "[]")
+    data["was_modified"] = bool(data.get("was_modified"))
+    return data
+
+
+def cmd_research_list(args, settings: Settings) -> int:
+    conn, repos = _open(settings)
+    try:
+        rows = repos.research_runs.list(args.status)
+        data = [_research_row_to_dict(r) for r in rows]
+        if args.json:
+            print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+        else:
+            if not data:
+                print("該当する調査結果はありません")
+            for r in data:
+                print(
+                    f"#{r['id']} [{r['review_status']}] status={r['status']} "
+                    f"conf={r['confidence']} 出典{len(r['sources'])}件 : {r['question']}"
+                )
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_research_show(args, settings: Settings) -> int:
+    conn, repos = _open(settings)
+    try:
+        row = repos.research_runs.get(args.id)
+        if row is None:
+            print(f"research run #{args.id} が見つかりません")
+            return 1
+        data = _research_row_to_dict(row)
+        if args.json:
+            print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+        else:
+            print(f"#{data['id']} [{data['review_status']}]")
+            print(f"質問: {data['question']}")
+            print(f"プロバイダー: {data['provider']} / 信頼度: {data['confidence']}")
+            print(f"\nAI回答:\n{data['answer']}")
+            if data["sources"]:
+                print("\n出典:")
+                for s in data["sources"]:
+                    print(f"- {s.get('url', '')} {s.get('title', '')}".rstrip())
+            if data["warnings"]:
+                print("\n警告: " + " / ".join(data["warnings"]))
+            if data["review_status"] != REVIEW_PENDING:
+                print(
+                    f"\nレビュー: {data['review_status']} by {data['reviewed_by']} "
+                    f"at {data['reviewed_at']} (修正={'あり' if data['was_modified'] else 'なし'})"
+                )
+                if data.get("resulting_knowledge_id"):
+                    print(f"昇格先ナレッジ: KB-{data['resulting_knowledge_id']}")
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_research_approve(args, settings: Settings) -> int:
+    """AI調査結果を人間が確認し、承認済み知識へ昇格する。
+
+    元のAI回答と出典は research_runs に残したまま、承認された本文を
+    knowledge_articles / knowledge_revisions へ保存する。
+    """
+    conn, repos = _open(settings)
+    try:
+        row = repos.research_runs.get(args.id)
+        if row is None:
+            print(f"research run #{args.id} が見つかりません")
+            return 1
+        if row["status"] != "ok":
+            print(f"research run #{args.id} は調査に失敗しているため承認できません")
+            return 2
+        if row["review_status"] != REVIEW_PENDING:
+            print(
+                f"research run #{args.id} は既に {row['review_status']} です"
+                "(二重承認はできません)"
+            )
+            return 2
+
+        original_answer = row["answer"] or ""
+        if args.answer_file:
+            # utf-8-sig: Windows のエディタが付けるBOMを回答本文へ混入させない
+            answer_text = Path(args.answer_file).read_text(encoding="utf-8-sig").strip()
+        else:
+            answer_text = original_answer.strip()
+        if not answer_text:
+            print("承認する回答本文が空です(--answer-file で指定してください)")
+            return 2
+
+        was_modified = answer_text != original_answer.strip()
+        sources = json.loads(row["sources_json"] or "[]")
+        source_urls = [s.get("url", "") for s in sources if isinstance(s, dict) and s.get("url")]
+        tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+        variants = [v.strip() for v in (args.variants or "").split(",") if v.strip()]
+
+        reason = args.reason or (
+            "AI調査結果を人間が修正のうえ承認" if was_modified else "AI調査結果を人間が承認"
+        )
+        knowledge_id = repos.knowledge.create(
+            canonical_question=row["question"],
+            answer=answer_text,
+            category=args.category,
+            tags=tags,
+            source_type=KnowledgeSourceType.APPROVED_AI,
+            approved_by=args.approved_by,
+            variants=variants,
+            valid_until=args.valid_until,
+            source_urls=source_urls,
+            change_reason=reason,
+        )
+        try:
+            repos.research_runs.mark_reviewed(
+                args.id,
+                review_status=REVIEW_APPROVED,
+                reviewed_by=args.approved_by,
+                reason=reason,
+                was_modified=was_modified,
+                approved_answer=answer_text,
+                resulting_knowledge_id=knowledge_id,
+            )
+        except ValueError as exc:
+            # 承認直前に他プロセスが承認した場合。作成済みナレッジを取り消す。
+            repos.knowledge.retire(knowledge_id, args.approved_by)
+            print(f"エラー: {exc}")
+            return 2
+
+        print(
+            f"承認済み知識として保存しました: KB-{knowledge_id} "
+            f"(research #{args.id} APPROVED, 修正={'あり' if was_modified else 'なし'})"
+        )
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_research_reject(args, settings: Settings) -> int:
+    conn, repos = _open(settings)
+    try:
+        row = repos.research_runs.get(args.id)
+        if row is None:
+            print(f"research run #{args.id} が見つかりません")
+            return 1
+        status = REVIEW_EXPIRED if args.expired else REVIEW_REJECTED
+        try:
+            repos.research_runs.mark_reviewed(
+                args.id,
+                review_status=status,
+                reviewed_by=args.approved_by,
+                reason=args.reason or "",
+            )
+        except ValueError as exc:
+            print(f"エラー: {exc}")
+            return 2
+        print(f"research #{args.id} を {status} にしました")
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_history(args, settings: Settings) -> int:
     conn, repos = _open(settings)
     try:
@@ -613,7 +849,11 @@ def cmd_history(args, settings: Settings) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aifaq", description="学習型AI FAQ (社内IT管理部門向け)")
     parser.add_argument("--json", action="store_true", help="JSON出力モード")
-    parser.add_argument("--fake-provider", action="store_true", help="テスト用: Gemini CLIの代わりにFakeProviderを使う")
+    parser.add_argument(
+        "--fake-provider",
+        action="store_true",
+        help="テスト用: 実際のAI CLI(Antigravity)の代わりにFakeProviderを使う",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init", aliases=["init-db"])
@@ -636,6 +876,42 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("history")
     p.add_argument("thread_id")
     p.set_defaults(func=cmd_history)
+
+    research = sub.add_parser("research", help="AI調査結果の確認と承認")
+    research_sub = research.add_subparsers(dest="research_command", required=True)
+
+    p = research_sub.add_parser("list")
+    p.add_argument(
+        "--status",
+        choices=[
+            REVIEW_PENDING, REVIEW_APPROVED, REVIEW_REJECTED,
+            REVIEW_EXPIRED, REVIEW_NOT_APPLICABLE,
+        ],
+        help="レビュー状態で絞り込む",
+    )
+    p.set_defaults(func=cmd_research_list)
+
+    p = research_sub.add_parser("show")
+    p.add_argument("id", type=int)
+    p.set_defaults(func=cmd_research_show)
+
+    p = research_sub.add_parser("approve", help="AI調査結果を承認済み知識へ昇格する")
+    p.add_argument("id", type=int)
+    p.add_argument("--approved-by", required=True)
+    p.add_argument("--answer-file", help="修正版の回答本文ファイル(省略時はAI回答をそのまま承認)")
+    p.add_argument("--category", default="other")
+    p.add_argument("--tags", help="カンマ区切り")
+    p.add_argument("--variants", help="カンマ区切りの別表現")
+    p.add_argument("--valid-until", help="ISO8601の有効期限")
+    p.add_argument("--reason", help="承認・修正の理由")
+    p.set_defaults(func=cmd_research_approve)
+
+    p = research_sub.add_parser("reject", help="AI調査結果を却下または期限切れにする")
+    p.add_argument("id", type=int)
+    p.add_argument("--approved-by", required=True, help="判断した担当者")
+    p.add_argument("--reason", help="却下理由")
+    p.add_argument("--expired", action="store_true", help="却下ではなく期限切れとして記録する")
+    p.set_defaults(func=cmd_research_reject)
 
     pending = sub.add_parser("pending")
     pending_sub = pending.add_subparsers(dest="pending_command", required=True)
@@ -667,10 +943,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = knowledge_sub.add_parser("import")
     p.add_argument("path", nargs="?")
+    p.add_argument("--actor", help="取り込み実行者(source_import_runs へ記録)")
     p.set_defaults(func=cmd_knowledge_import)
 
     p = knowledge_sub.add_parser("sync")
     p.add_argument("path", nargs="?", default=None)
+    p.add_argument("--actor", help="取り込み実行者(source_import_runs へ記録)")
     p.set_defaults(func=cmd_knowledge_import)
 
     p = knowledge_sub.add_parser("search")
@@ -715,8 +993,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    settings = Settings.from_env()
-    return args.func(args, settings)
+    try:
+        settings = Settings.from_env()
+    except ValueError as exc:
+        # 不正な環境変数(AIFAQ_RESEARCH_PROVIDER など)は起動時に弾く。
+        print(f"設定エラー: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return args.func(args, settings)
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if "locked" in message or "busy" in message:
+            # 「database is locked」だけでは原因が伝わらないので、
+            # 何が起きていて何をすればよいかを明示する。
+            print(
+                f"エラー: データベース({settings.db_path})がロックされています。"
+                "他の aifaq プロセスが実行中でないか確認し、終了後に再実行してください。",
+                file=sys.stderr,
+            )
+            return 3
+        raise
 
 
 if __name__ == "__main__":

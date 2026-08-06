@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    env:
+      # CIでは実AI CLI (Antigravity/agy) を絶対に呼ばない。
+      # 認証も課金も無い環境で外部プロセスへ出ていかないよう、
+      # FakeProvider を明示的に選択する (instruction-005 §5.3)。
+      AIFAQ_RESEARCH_PROVIDER: fake
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Verify the real AI CLI is absent
+        # agy が入っていないことを確認し、テストが実CLIへ到達しないことを担保する。
+        run: |
+          if command -v agy >/dev/null 2>&1; then
+            echo "agy must not be installed on CI runners"
+            exit 1
+          fi
+          echo "agy is not installed (expected)"
+
+      - name: Run tests with coverage
+        run: |
+          python -m pytest -q --cov=aifaq --cov-report=term-missing --cov-fail-under=80

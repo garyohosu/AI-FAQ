@@ -11,6 +11,6 @@ memory_type=DECISION として `memory_entries` へ取り込まれます。
 
 ## AI調査結果は自動でナレッジ化しない
 
-Gemini CLIによるWeb調査の結果は、暫定回答としてその場で提示するのみとし、
+Antigravity CLIによるWeb調査の結果は、暫定回答としてその場で提示するのみとし、
 `knowledge_articles` へ自動的に昇格させない。ナレッジ化するには人間の
 明示的な承認操作が必要とする。

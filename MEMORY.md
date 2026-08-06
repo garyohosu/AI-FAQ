@@ -43,6 +43,19 @@ AIはこのファイルへの変更案を提案できますが、人間の承認
 - valid_until:
 - notes: 用語の一般的な説明のみ。社内特有の運用ルールは含まない。
 
+### SRC-003
+- path: knowledge/public/sample-troubleshooting.xlsx
+- contains: 架空サンプルのトラブルシューティング一覧(プリンター・ネットワーク)
+- sheets: プリンター, ネットワーク
+- scope: PUBLIC
+- category: troubleshooting
+- owner: IT管理部
+- priority: normal
+- status: active
+- last_reviewed: 2026-08-06
+- valid_until:
+- notes: 動作確認用の架空データ。実在の機器・担当者・資産番号は含まない。非表示シート「非表示メモ」は取り込み対象外。
+
 ## Terminology
 
 社内用語・略語は [memory/terminology.md](memory/terminology.md) を参照してください。
@@ -53,8 +66,10 @@ AIはこのファイルへの変更案を提案できますが、人間の承認
 - 次に `authoritative`/`high` の取り込み資料、その後通常優先度の資料を検索する。
 - 上記で回答できない場合のみ、`MEMORY.md`/`memory/*.md` を用語・所在確認の
   補助記憶として使う(回答本文の唯一の根拠にはしない)。
-- 公開一般質問かつ `safe_for_external_research=true` の場合のみGemini CLIで
-  Web調査する。
+- 公開一般質問かつ `safe_for_external_research=true` の場合のみ
+  Antigravity CLI (`agy`) でWeb調査する。
+- 機密性の高い質問・人間対応の希望・行き詰まりは、取り込み資料の一致より
+  先に判定し、人間へ引き継ぐ(資料の偶然の一致で握りつぶさない)。
 - 判断に迷う場合は外部送信せず人間へ引き継ぐ。
 
 ## Important Decisions

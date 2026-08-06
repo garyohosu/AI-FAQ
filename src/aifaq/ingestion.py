@@ -48,6 +48,9 @@ class FileImportOutcome:
     relative_path: str
     status: str  # imported | skipped_unchanged | failed
     warnings: list[ImportWarning]
+    #: 取り込み前から source_files に登録済みだったか。
+    #: source_import_runs の added / updated を区別するために使う。
+    was_existing: bool = False
 
 
 def sha256_of_file(path: Path) -> str:
@@ -69,6 +72,13 @@ def _default_scope(relative_path: str) -> SourceScope:
     return SourceScope.INTERNAL
 
 
+#: 取り込み対象から外すファイル名(小文字比較)。
+#: `knowledge/**/README.md` はフォルダの使い方を説明するリポジトリの
+#: 付属文書であって、FAQの回答根拠になる知識ではない。取り込むと
+#: 「管理者」「社内」等の一般語で誤って回答に採用されてしまうため除外する。
+EXCLUDED_FILENAMES = {"readme.md"}
+
+
 def scan_supported_files(settings: Settings, repo_root: Path) -> list[Path]:
     """`knowledge/` 配下の対応形式ファイルを列挙する(内容は読まない)。"""
     knowledge_dir = repo_root / settings.knowledge_dir
@@ -76,8 +86,11 @@ def scan_supported_files(settings: Settings, repo_root: Path) -> list[Path]:
         return []
     files = []
     for path in sorted(knowledge_dir.rglob("*")):
-        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-            files.append(path)
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+        if path.name.lower() in EXCLUDED_FILENAMES:
+            continue
+        files.append(path)
     return files
 
 
@@ -313,8 +326,9 @@ def import_file(
 
     digest = sha256_of_file(path)
     existing = conn_repos.source_files.get_by_path(relative_path)
+    was_existing = existing is not None
     if existing is not None and existing["sha256"] == digest and existing["status"] == "active":
-        return FileImportOutcome(relative_path, "skipped_unchanged", warnings)
+        return FileImportOutcome(relative_path, "skipped_unchanged", warnings, was_existing)
 
     ext = path.suffix.lower()
     try:
@@ -332,7 +346,7 @@ def import_file(
             warnings.append(
                 ImportWarning(file=relative_path, message="未対応の拡張子", severity="failed")
             )
-            return FileImportOutcome(relative_path, "failed", warnings)
+            return FileImportOutcome(relative_path, "failed", warnings, was_existing)
     except Exception as exc:  # noqa: BLE001 - 1ファイルの失敗で全体を止めない
         warnings.append(
             ImportWarning(file=relative_path, message=f"読み込み失敗: {exc}", severity="failed")
@@ -351,7 +365,7 @@ def import_file(
             error_summary=str(exc)[:500],
         )
         conn_repos.source_files.upsert(record)
-        return FileImportOutcome(relative_path, "failed", warnings)
+        return FileImportOutcome(relative_path, "failed", warnings, was_existing)
 
     warnings.extend(ImportWarning(file=relative_path, message=m) for m in msgs)
 
@@ -373,7 +387,7 @@ def import_file(
     for chunk in chunks:
         chunk.source_file_id = source_file_id
     conn_repos.source_chunks.replace_for_file(source_file_id, chunks)
-    return FileImportOutcome(relative_path, "imported", warnings)
+    return FileImportOutcome(relative_path, "imported", warnings, was_existing)
 
 
 def import_all(

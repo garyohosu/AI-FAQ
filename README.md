@@ -39,12 +39,18 @@ SQLiteリポジトリ層 (aifaq/db.py, repositories.py) -- data/aifaq.db
 メモリー索引層 (aifaq/memory.py)          -- MEMORY.md, memory/*.md
 セキュリティ・外部送信可否判定層 (aifaq/security.py)
   ↓
-AI CLIプロバイダー層 (aifaq/providers/*) -- Gemini CLI / FakeProvider
+AI CLIプロバイダー層 (aifaq/providers/*) -- Antigravity CLI / FakeProvider
 ```
 
-`ResearchProvider` はProtocolで抽象化しており、`GeminiCLIProvider` を
+`ResearchProvider` はProtocolで抽象化しており、`AntigravityProvider` を
 将来 Claude Code CLI / Codex CLI / ローカルLLM 用のプロバイダーへ
 差し替え可能です(`aifaq/providers/base.py`)。
+
+```text
+ResearchProvider (Protocol)
+├─ AntigravityProvider     # 実環境用 (agy CLI)
+└─ FakeResearchProvider    # 自動テスト用
+```
 
 ### 回答フロー(LangGraph)
 
@@ -70,7 +76,7 @@ IT管理者が人間回答を登録)。
 
 ## セキュリティ境界
 
-以下は決定論的ルール(`aifaq/security.py`)で検出し、外部AI(Gemini CLI)
+以下は決定論的ルール(`aifaq/security.py`)で検出し、外部AI(Antigravity CLI)
 へは絶対に送信しません。判断に迷う場合も送信せず人間へ引き継ぎます。
 
 - パスワード・秘密鍵・トークン・認証コードらしき語や値
@@ -80,41 +86,121 @@ IT管理者が人間回答を登録)。
   社内固有手続きを示す語、工場名・設備名・資産番号
 - アカウント停止・権限変更・退職者処理などの重要操作
 
-`knowledge/internal/` や `memory/` の内容がGemini CLIへ渡ることもありません
-(Web調査プロンプトには質問文だけを渡します)。
+`knowledge/internal/` や `memory/` の内容がAntigravity CLIへ渡ることも
+ありません(Web調査プロンプトには質問文だけを渡します)。
 
-Gemini CLIは `subprocess.run(shell=False)` で引数配列として呼び出し、
-`--yolo` は使用しません。`.gemini/settings.json` でWeb検索・Web取得以外の
-ツール(ファイル書換・シェル実行等)を無効化しています。
+Antigravity CLIは `subprocess.run(shell=False)` で引数配列として呼び出し、
+`--dangerously-skip-permissions` は使用しません。既定のヘッドレス実行では
+ファイル書換・シェル実行などのツールはagy側で自動拒否されます
+(Web検索・Web取得は権限フラグ無しで動作することを実機で確認済み)。
+
+さらに、取り込み済み資料は「人間が回答として承認したもの」ではないため、
+機密性の高い質問・人間対応の希望・行き詰まりの判定は、資料の一致より先に
+行います(`routing.decide_route`)。資料の偶然の一致で人間引き継ぎを
+握りつぶさないための順序です。
 
 ## セットアップ
 
 ```bash
-# Python 3.12+ (開発・確認は Python 3.14.0 で実施。詳細は「既知の制約」参照)
+# Python 3.12 / 3.13 で動作確認済み (CIでも両方をテストしています)
 python -m venv .venv
 source .venv/Scripts/activate   # Windows PowerShellの場合は .venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 ```
 
-## Gemini CLIの準備
+## Antigravity CLI の準備
 
-このリポジトリは [Gemini CLI](https://github.com/google-gemini/gemini-cli)
-をサブプロセスとして呼び出します。あらかじめ別途インストール・ログイン
-してください。
+このリポジトリは Antigravity CLI (`agy`) をサブプロセスとして呼び出します。
+あらかじめ別途インストール・ログインしてください。
 
 ```bash
-npm install -g @google/gemini-cli
-gemini --version
+agy --version   # 動作確認は 1.1.9 / 1.1.10 で実施
 ```
 
-**重要**: Gemini CLI自体は内部でGoogleのクラウドサービスと通信します。
-「手元のChatGPT Plus等の契約がそのままAPI利用料になる」という意味では
-ありません。組織の情報管理規則・利用規約を確認したうえで利用してください。
-このアプリは社内固有情報・機密情報・個人情報をGemini CLIへ送信しない
-よう設計していますが、最終的な利用可否は組織のポリシーに従ってください。
+### なぜ Gemini CLI から Antigravity へ移行したか
 
-`aifaq doctor` は、Gemini CLIの存在・バージョン・危険なツールが無効化
-されているかを確認しますが、実際にAIへ問い合わせることはありません。
+初期実装(instruction 001〜004)は Gemini CLI を前提にしていましたが、
+利用環境のアカウントが `IneligibleTierError`(利用ティア制限)を返し、
+実際の問い合わせができず、成功パスを一度も確認できませんでした。
+
+一方 Antigravity CLI は、同じ利用者の既存プロジェクト
+(`werewolf-game` の `config/agents.json`、`OracleCouncil` の
+`adapters/agy.py`)で実運用の実績があり、本作業でも実機で
+Web調査の成功パスを確認できたため、こちらへ移行しました。
+
+### 呼び出し方式(実機で確認した内容)
+
+```bash
+agy --print "<調査指示>" --output-format json
+```
+
+`--output-format json` は次のエンベロープを返します。
+
+```json
+{"conversation_id": "...", "status": "SUCCESS", "response": "<本文>",
+ "duration_seconds": 2.5, "num_turns": 1, "usage": {...}}
+```
+
+実機で確認した重要な挙動:
+
+- Web検索・Web取得は**権限フラグ無しで動作**します。
+- 調査中に1件でもツール呼び出しが失敗すると、最終回答が完全に得られて
+  いても `status` が `ERROR` になり、失敗内容が `error` に入ります。
+  本実装は本文が取り出せる限り回答を捨てず、`error` の内容を**警告として
+  回答に添えて**人間に見せます。
+- `read_file` などのツールは、ヘッドレス実行では自動拒否されます
+  (`a tool required the "read_file" permission that headless mode cannot
+  prompt for`)。このため参照渡し(後述の `transport=file`)には
+  agy 側の `permissions.allow` 設定が別途必要です。
+
+**重要**: Antigravity CLI 自体は内部でクラウドサービスと通信します。
+組織の情報管理規則・利用規約を確認したうえで利用してください。
+このアプリは社内固有情報・機密情報・個人情報を外部へ送信しないよう
+設計していますが、最終的な利用可否は組織のポリシーに従ってください。
+
+`aifaq doctor` は、Antigravity CLI の存在とバージョンを確認しますが、
+実際にAIへ問い合わせることはありません。
+
+## 設定(環境変数)
+
+特定製品名に依存しない `AIFAQ_RESEARCH_*` に統一しています。
+
+| 環境変数 | 既定値 | 説明 |
+|---|---|---|
+| `AIFAQ_RESEARCH_PROVIDER` | `antigravity` | `antigravity` または `fake` |
+| `AIFAQ_RESEARCH_BIN` | `agy` | 実行ファイル名 |
+| `AIFAQ_RESEARCH_TRANSPORT` | `arg` | `arg`(引数渡し) / `file`(参照渡し) |
+| `AIFAQ_RESEARCH_TIMEOUT` | `180` | 秒 |
+| `AIFAQ_RESEARCH_WORKDIR` | (OS既定) | 参照渡し時の一時ディレクトリの親 |
+| `AIFAQ_RESEARCH_MODEL` | (未指定) | `--model` へ渡す値 |
+
+旧 `AIFAQ_GEMINI_BIN` も当面読みますが、使用すると非推奨警告を出します。
+`AIFAQ_RESEARCH_BIN` へ移行してください。
+
+### 調査指示の渡し方(`AIFAQ_RESEARCH_TRANSPORT`)
+
+- **`arg`(既定・実機確認済み)**: 調査指示をコマンドライン引数として渡します。
+  過去に稼働実績のある `werewolf-game` / `OracleCouncil` と同じ方式です。
+  agy は stdin や `--prompt-file` を持たないため、プロンプトは必ず argv に
+  載ります。Windows の `CreateProcess` は約32,767 UTF-16コード単位の
+  上限があるため、超過する場合はプロセス起動前に検出してエラーにします。
+- **`file`(未検証)**: 公開判定済みの調査指示だけを一時ファイルへ書き、
+  短い参照指示だけを argv で渡します。リポジトリ本体から分離した一時
+  ディレクトリを使い、成否にかかわらず削除します。
+  **ただし、agy のヘッドレス実行は `read_file` を自動拒否する**ため、
+  agy 側の `settings.json` に `permissions.allow` を設定しない限り動作しません。
+  本作業環境では設定変更を行わなかったため**実機未検証**です。
+
+### 実AI CLIを使わずFakeProviderで動かす
+
+```bash
+aifaq --fake-provider ask "質問文"        # 単発
+export AIFAQ_RESEARCH_PROVIDER=fake       # セッション全体
+```
+
+CI(GitHub Actions)は `AIFAQ_RESEARCH_PROVIDER=fake` を設定し、
+`agy` が入っていないことを明示的に検証したうえでテストします。
+実AI CLIをCIから呼ぶことはありません。
 
 ## CLI使用例
 
@@ -135,6 +221,13 @@ aifaq knowledge import                      # 差分取り込み(knowledge/全�
 aifaq knowledge import knowledge/public/x.md  # 1ファイルだけ取り込み
 aifaq knowledge search "検索語"
 aifaq knowledge list
+aifaq research list                         # AI調査結果の一覧(既定は全件)
+aifaq research list --status PENDING        # 未レビューのみ
+aifaq research show ID                      # 元のAI回答・出典・警告を確認
+aifaq research approve ID --approved-by 名前 # 承認済み知識へ昇格
+aifaq research approve ID --approved-by 名前 --answer-file corrected.md  # 修正して承認
+aifaq research reject ID --approved-by 名前 --reason "情報が古い"
+aifaq research reject ID --approved-by 名前 --expired                    # 期限切れ
 aifaq memory validate                       # MEMORY.mdの形式検証
 aifaq memory show                           # MEMORY.mdの内容表示
 aifaq memory sync                           # Markdown → DBへ同期
@@ -143,7 +236,7 @@ aifaq history THREAD
 
 `--json` はサブコマンドより前に付けてください(例:
 `aifaq --json knowledge list`)。`--fake-provider` はテスト・デモ用で、
-Gemini CLIの代わりにFakeProviderを使います。
+実AI CLI(Antigravity)の代わりにFakeProviderを使います。
 
 ### コマンド名の対応関係(instruction 001/002/003 → 004)
 
@@ -261,10 +354,12 @@ aifaq knowledge search "Wi-Fi"  # 承認済み知識 + 取り込み資料を横�
 ## セキュリティ上の制限
 
 - 「セキュリティ境界」章の情報は外部AIへ送信しません。
-- Gemini CLIは `shell=False` の引数配列で呼び出し、`--yolo` は使いません。
-- `.gemini/settings.json` でWeb検索・Web取得以外のツールを無効化しています。
-  ただし本設定のキー名はGemini CLI 0.50.0時点の確認内容であり、導入環境の
-  バージョンに応じて公式ドキュメントで再確認してください。
+- Antigravity CLIは `shell=False` の引数配列で呼び出し、
+  `--dangerously-skip-permissions` は使いません。ヘッドレス実行では
+  ファイル書換・シェル実行などのツールがagy側で自動拒否されます。
+- 取り込み済み資料の一致より先に、機密性・人間対応希望・行き詰まりの
+  判定を行います(資料の偶然の一致で人間引き継ぎを握りつぶさないため)。
+- `knowledge/**/README.md` はフォルダ説明用の付属文書なので取り込みません。
 - 危険な操作(アカウント削除・権限変更・ネットワーク遮断等)を自動実行する
   機能はありません。FAQとして手順を提示するだけです。
 
@@ -275,28 +370,24 @@ python -m pytest -q
 python -m pytest -q --cov=aifaq --cov-report=term-missing
 ```
 
-外部ネットワークと実Gemini CLIは一切呼び出さず、`FakeResearchProvider`
-または `unittest.mock` によるモックのみで完結します。
+外部ネットワークと実AI CLI(Antigravity)は一切呼び出さず、
+`FakeResearchProvider` または `unittest.mock` によるモックのみで完結します。
+
+CI(GitHub Actions)は Python 3.12 / 3.13 の両方で実行し、
+`AIFAQ_RESEARCH_PROVIDER=fake` を設定したうえで `agy` が
+インストールされていないことを検証します。
 
 ## 既知の制約
 
-- **開発・動作確認のPythonバージョン**: `pyproject.toml` は
-  `requires-python = ">=3.12"` としていますが、本リポジトリの開発・
-  テスト実行環境には Python 3.12 系が存在せず、実際には **Python 3.14.0**
-  で動作確認しました。3.12/3.13での動作確認はできていません
-  (言語機能面では3.12+互換のコードのみを使用しています)。
-- **Gemini CLIの実呼び出し未確認**: 本環境のGemini CLIアカウントは
-  `IneligibleTierError`(利用ティア制限)のため、実際のWeb調査APIを
-  伴う成功パスを確認できませんでした。`gemini --version` の実行、
-  `--help` によるコマンド仕様の確認、`--skip-trust` が必要な
-  trusted-folders仕様の確認は実施済みです。`GeminiCLIProvider` の
-  JSON抽出・エラー分類ロジックは `unittest.mock` で単体テスト済みですが、
-  実際のCLI成功時の出力形式(JSON包みの正確なキー名)は導入環境で
-  一度確認することを推奨します。
-- **AI調査結果のナレッジ昇格コマンド未実装**: instruction-001は
-  `research approve <id>` 相当のコマンドを想定していましたが、
-  instruction-004のCLI一覧には含まれていなかったため、本MVPでは
-  未実装です。AI調査結果は暫定回答としてのみ提示されます。
+- **参照渡し(`AIFAQ_RESEARCH_TRANSPORT=file`)は実機未検証**: agyの
+  ヘッドレス実行が `read_file` を自動拒否するため、agy側の
+  `permissions.allow` を設定しない限り動作しません。本作業では利用者の
+  agy全体設定を変更しない判断をしたため、この経路は実機で確認して
+  いません。既定の `arg` は実機確認済みです。
+- **日本語の検索語抽出は簡易実装**: 形態素解析器を使わず、漢字・
+  カタカナ・英数字の連なりを内容語として取り出し、ひらがなを捨てる
+  ヒューリスティックです(`util.extract_search_terms`)。ひらがなだけの
+  語(「ぱそこん」等)は検索語になりません。
 - **`check_source_conflicts` は簡易実装**: 複数の `authoritative` 資料が
   同一検索結果に含まれ、内容の類似度が低い場合にのみ「矛盾」と判定する
   簡易ヒューリスティックです。意味的な矛盾検出ではありません。

@@ -222,6 +222,9 @@ def build_graph(
             confidence=result.confidence,
             sources=[s.model_dump(mode="json") for s in result.sources],
             warnings=result.warnings,
+            # 人間承認(`aifaq research approve`)で元のAI回答を参照できるよう
+            # 回答本文も保存する。承認するまでナレッジには昇格しない。
+            answer=result.answer,
         )
         sufficient = (
             result.confidence >= settings.research_confidence_threshold

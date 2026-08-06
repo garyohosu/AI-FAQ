@@ -18,16 +18,51 @@ from aifaq.models import (
     SourceChunk,
     SourceFileRecord,
 )
-from aifaq.util import normalize_text, now_iso, parse_iso
+from aifaq.util import (
+    extract_search_terms,
+    fts_terms,
+    is_relevant_match,
+    normalize_text,
+    now_iso,
+    parse_iso,
+    relevance_key,
+)
 
 
 def _dumps(value) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _quote_fts(term: str) -> str:
+    return '"' + term.replace('"', '""') + '"'
+
+
 def _fts_phrase(query: str) -> str:
     """trigramトークナイザー向けに、クエリ全体を1つの引用フレーズにする。"""
-    return '"' + query.replace('"', '""') + '"'
+    return _quote_fts(query)
+
+
+def _fts_or(terms: list[str]) -> str:
+    """複数の検索語をOR結合したFTS5クエリを作る。"""
+    return " OR ".join(_quote_fts(t) for t in terms)
+
+
+def _rank_by_relevance(rows: list[sqlite3.Row], terms: list[str], fields: tuple[str, ...]):
+    """OR検索の結果から無関係な行を落とし、関連の強い順に並べ替える。
+
+    OR検索は語を1つ含むだけで当たるため、そのまま使うと無関係な資料を拾う。
+    `is_relevant_match` で足切りしたうえで、一致語数・最長一致語長の順に
+    並べ替える(同点はFTSのbm25順=元の並びを保つ)。
+    """
+    scored = []
+    for index, row in enumerate(rows):
+        text = " ".join(str(row[f] or "") for f in fields)
+        if not is_relevant_match(text, terms):
+            continue
+        hits, longest = relevance_key(text, terms)
+        scored.append((-hits, -longest, index, row))
+    scored.sort(key=lambda item: item[:3])
+    return [item[3] for item in scored]
 
 
 # ---------------------------------------------------------------------------
@@ -228,34 +263,62 @@ class KnowledgeRepository:
             is_stale=is_stale,
         )
 
+    def _fts_search(self, match_expr: str, limit: int) -> list[sqlite3.Row]:
+        try:
+            return self.conn.execute(
+                """
+                SELECT k.*, bm25(knowledge_fts) AS rank
+                FROM knowledge_fts
+                JOIN knowledge_articles k ON k.id = knowledge_fts.knowledge_id
+                WHERE knowledge_fts MATCH ? AND k.status='APPROVED'
+                ORDER BY rank LIMIT ?
+                """,
+                (match_expr, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
     def search(self, query: str, limit: int = 5) -> list[KnowledgeMatch]:
+        """承認済み知識を検索する。
+
+        優先順位は「完全一致 → フレーズ一致 → 語のOR一致 → LIKE」。
+        完全一致(score=1.0)とフレーズ一致は従来どおりの扱いを保ち、
+        語のOR一致は取りこぼし救済なのでLIKEと同じ低いスコアを与える
+        (`knowledge_match_threshold` を越えず、確認質問や調査経路を
+        勝手に飛ばさないようにするため)。
+        """
+        q = query.strip()
         exact = self.search_exact(query)
         results: list[KnowledgeMatch] = [exact] if exact else []
         seen_ids = {m.knowledge_id for m in results}
 
-        if self._fts and len(query.strip()) >= 3:
-            try:
-                rows = self.conn.execute(
-                    """
-                    SELECT k.*, bm25(knowledge_fts) AS rank
-                    FROM knowledge_fts
-                    JOIN knowledge_articles k ON k.id = knowledge_fts.knowledge_id
-                    WHERE knowledge_fts MATCH ? AND k.status='APPROVED'
-                    ORDER BY rank LIMIT ?
-                    """,
-                    (_fts_phrase(query.strip()), limit),
-                ).fetchall()
-                for row in rows:
-                    if row["id"] in seen_ids:
-                        continue
-                    # bm25: 小さいほど良い一致。0-1へ粗く正規化する。
-                    score = 1.0 / (1.0 + max(row["rank"], 0.0))
-                    results.append(self._to_match(row, score=score))
-                    seen_ids.add(row["id"])
-            except sqlite3.OperationalError:
-                pass
+        def add(rows, score_of) -> None:
+            for row in rows:
+                if row["id"] in seen_ids:
+                    continue
+                results.append(self._to_match(row, score=score_of(row)))
+                seen_ids.add(row["id"])
+
+        # フレーズ一致: bm25 を 0-1 へ粗く正規化する(小さいほど良い一致)。
+        if self._fts and len(q) >= 3:
+            add(
+                self._fts_search(_fts_phrase(q), limit),
+                lambda row: 1.0 / (1.0 + max(row["rank"], 0.0)),
+            )
+
+        # 語のOR一致: 自然文の質問でも承認済み知識を取りこぼさないための救済。
+        # 関連度は全検索語に対して測る(理由は SourceChunkRepository.search を参照)。
+        if self._fts and len(results) < limit:
+            or_terms = fts_terms(q)
+            if or_terms:
+                rows = self._fts_search(_fts_or(or_terms), limit * 5)
+                ranked = _rank_by_relevance(
+                    rows, extract_search_terms(q), ("canonical_question", "answer")
+                )
+                add(ranked[:limit], lambda row: 0.5)
+
         if not self._fts or len(results) < limit:
-            like = f"%{query}%"
+            like = f"%{q}%"
             rows = self.conn.execute(
                 """
                 SELECT * FROM knowledge_articles
@@ -265,11 +328,7 @@ class KnowledgeRepository:
                 """,
                 (like, like, limit),
             ).fetchall()
-            for row in rows:
-                if row["id"] in seen_ids:
-                    continue
-                results.append(self._to_match(row, score=0.5))
-                seen_ids.add(row["id"])
+            add(rows, lambda row: 0.5)
 
         return results[:limit]
 
@@ -438,16 +497,21 @@ class ResearchRunRepository:
         confidence: float | None,
         sources: list[dict],
         warnings: list[str],
+        answer: str = "",
         error_summary: str | None = None,
     ) -> int:
         ts = now_iso()
+        # 調査に失敗した run は人間承認の対象にならないので、はじめから
+        # レビュー対象外(NOT_APPLICABLE)にしておく。
+        review_status = "PENDING" if status == "ok" else "NOT_APPLICABLE"
         with self.conn:
             cur = self.conn.execute(
                 """
                 INSERT INTO research_runs
                 (thread_id, question, provider, status, confidence, sources_json,
-                 warnings_json, error_summary, started_at, finished_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 warnings_json, error_summary, started_at, finished_at,
+                 answer, review_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     thread_id,
@@ -460,9 +524,139 @@ class ResearchRunRepository:
                     error_summary,
                     ts,
                     ts,
+                    answer,
+                    review_status,
                 ),
             )
         return int(cur.lastrowid)
+
+    def get(self, run_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM research_runs WHERE id=?", (run_id,)
+        ).fetchone()
+
+    def list(self, review_status: str | None = None) -> list[sqlite3.Row]:
+        if review_status is None:
+            return self.conn.execute(
+                "SELECT * FROM research_runs ORDER BY id DESC"
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM research_runs WHERE review_status=? ORDER BY id DESC",
+            (review_status,),
+        ).fetchall()
+
+    def mark_reviewed(
+        self,
+        run_id: int,
+        *,
+        review_status: str,
+        reviewed_by: str,
+        reason: str = "",
+        was_modified: bool = False,
+        approved_answer: str | None = None,
+        resulting_knowledge_id: int | None = None,
+    ) -> None:
+        """レビュー結果を記録する。
+
+        ``review_status='PENDING'`` の行だけを更新することで、同じ run の
+        二重承認を SQL の条件で防ぐ。更新件数0なら呼び出し側が弾く。
+        """
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                UPDATE research_runs
+                SET review_status=?, reviewed_by=?, reviewed_at=?, review_reason=?,
+                    was_modified=?, approved_answer=?, resulting_knowledge_id=?
+                WHERE id=? AND review_status='PENDING'
+                """,
+                (
+                    review_status,
+                    reviewed_by,
+                    now_iso(),
+                    reason,
+                    1 if was_modified else 0,
+                    approved_answer,
+                    resulting_knowledge_id,
+                    run_id,
+                ),
+            )
+        if cur.rowcount == 0:
+            raise ValueError(
+                f"research run {run_id} はレビュー待ち(PENDING)ではありません"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Source import runs
+# ---------------------------------------------------------------------------
+
+
+class SourceImportRunRepository:
+    """知識取り込みの実行単位を記録する (instruction-005 §5.2)。"""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    def start(self, *, target_path: str, actor: str) -> int:
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                INSERT INTO source_import_runs (started_at, target_path, actor)
+                VALUES (?, ?, ?)
+                """,
+                (now_iso(), target_path, actor),
+            )
+        return int(cur.lastrowid)
+
+    def finish(
+        self,
+        run_id: int,
+        *,
+        detected: int = 0,
+        added: int = 0,
+        updated: int = 0,
+        skipped_unchanged: int = 0,
+        missing: int = 0,
+        failed: int = 0,
+        warnings: list[str] | None = None,
+        error_summary: str = "",
+        succeeded: bool = True,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE source_import_runs
+                SET finished_at=?, processed=?, imported=?, skipped_unchanged=?,
+                    failed=?, warnings_json=?, detected=?, added=?, updated=?,
+                    missing=?, error_summary=?, succeeded=?
+                WHERE id=?
+                """,
+                (
+                    now_iso(),
+                    detected,
+                    added + updated,
+                    skipped_unchanged,
+                    failed,
+                    _dumps(warnings or []),
+                    detected,
+                    added,
+                    updated,
+                    missing,
+                    error_summary,
+                    1 if succeeded else 0,
+                    run_id,
+                ),
+            )
+
+    def get(self, run_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM source_import_runs WHERE id=?", (run_id,)
+        ).fetchone()
+
+    def list(self, limit: int = 20) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM source_import_runs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
 
 
 # ---------------------------------------------------------------------------
@@ -692,43 +886,91 @@ class SourceChunkRepository:
                         (cur.lastrowid, source_file_id, chunk.heading or "", chunk.content),
                     )
 
-    def search(self, query: str, limit: int = 5) -> list[sqlite3.Row]:
-        excluded_status = ("retired", "forbidden", "missing")
-        placeholders = ",".join("?" for _ in excluded_status)
-        results: list[sqlite3.Row] = []
+    _EXCLUDED_STATUS = ("retired", "forbidden", "missing")
+    #: OR検索では足切り前に多めに取り、関連順に並べ替えてから絞る。
+    _OVERFETCH = 5
 
-        if self._fts and len(query.strip()) >= 3:
-            try:
-                results = self.conn.execute(
-                    f"""
-                    SELECT c.*, f.relative_path, f.scope, f.status AS file_status,
-                           f.priority, f.owner, bm25(source_fts) AS rank
-                    FROM source_fts
-                    JOIN source_chunks c ON c.id = source_fts.chunk_id
-                    JOIN source_files f ON f.id = c.source_file_id
-                    WHERE source_fts MATCH ? AND f.status NOT IN ({placeholders})
-                    ORDER BY rank LIMIT ?
-                    """,
-                    (_fts_phrase(query.strip()), *excluded_status, limit),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                results = []
+    def _fts_query(self, match_expr: str, limit: int) -> list[sqlite3.Row]:
+        placeholders = ",".join("?" for _ in self._EXCLUDED_STATUS)
+        try:
+            return self.conn.execute(
+                f"""
+                SELECT c.*, f.relative_path, f.scope, f.status AS file_status,
+                       f.priority, f.owner, bm25(source_fts) AS rank
+                FROM source_fts
+                JOIN source_chunks c ON c.id = source_fts.chunk_id
+                JOIN source_files f ON f.id = c.source_file_id
+                WHERE source_fts MATCH ? AND f.status NOT IN ({placeholders})
+                ORDER BY rank LIMIT ?
+                """,
+                (match_expr, *self._EXCLUDED_STATUS, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # 不正なFTS式や索引未作成でも検索全体を落とさない。
+            return []
 
-        if results:
-            return results
-
-        like = f"%{query}%"
+    def _like_query(self, terms: list[str], limit: int) -> list[sqlite3.Row]:
+        status_placeholders = ",".join("?" for _ in self._EXCLUDED_STATUS)
+        like_clause = " OR ".join("c.content LIKE ?" for _ in terms)
         return self.conn.execute(
             f"""
             SELECT c.*, f.relative_path, f.scope, f.status AS file_status,
                    f.priority, f.owner
             FROM source_chunks c
             JOIN source_files f ON f.id = c.source_file_id
-            WHERE c.content LIKE ? AND f.status NOT IN ({placeholders})
+            WHERE ({like_clause}) AND f.status NOT IN ({status_placeholders})
             LIMIT ?
             """,
-            (like, *excluded_status, limit),
+            (*[f"%{t}%" for t in terms], *self._EXCLUDED_STATUS, limit),
         ).fetchall()
+
+    def search(self, query: str, limit: int = 5) -> list[sqlite3.Row]:
+        """取り込み済み資料を検索する。
+
+        自然文の質問をそのまま1フレーズとして検索すると、文全体が資料に
+        現れることはまずないため、ほぼ必ず0件になる。そこで段階的に
+        フォールバックする:
+
+        1. クエリ全体のフレーズ検索 (最も精度が高い。完全一致を優先)
+        2. 抽出した検索語のOR検索 (FTS5、3文字以上の語のみ)
+        3. 抽出した検索語のLIKE検索 (2文字語やFTS5非対応環境向け)
+        4. クエリ全体のLIKE検索 (最後の手段)
+
+        2と3は足切り(`is_relevant_match`)と関連順の並べ替えを行い、
+        語を1つ含むだけの無関係な資料を拾わないようにする。
+        """
+        q = query.strip()
+        if not q:
+            return []
+
+        # 1. フレーズ検索
+        if self._fts and len(q) >= 3:
+            rows = self._fts_query(_fts_phrase(q), limit)
+            if rows:
+                return rows
+
+        # 関連度は必ず「抽出した全検索語」に対して測る。FTS5へ渡せる3文字以上の
+        # 語だけで測ると、短い語が分母から消えて関連度が過大評価され、
+        # 「Windows」のような一般語ひとつで無関係な資料を拾ってしまう。
+        all_terms = extract_search_terms(q)
+
+        # 2. 検索語のOR検索 (FTS5)
+        or_terms = fts_terms(q)
+        if self._fts and or_terms:
+            rows = self._fts_query(_fts_or(or_terms), limit * self._OVERFETCH)
+            ranked = _rank_by_relevance(rows, all_terms, ("content", "heading"))
+            if ranked:
+                return ranked[:limit]
+
+        # 3. 検索語のLIKE検索 (2文字語・FTS5非対応環境)
+        if all_terms:
+            rows = self._like_query(all_terms, limit * self._OVERFETCH)
+            ranked = _rank_by_relevance(rows, all_terms, ("content", "heading"))
+            if ranked:
+                return ranked[:limit]
+
+        # 4. クエリ全体のLIKE検索
+        return self._like_query([q], limit)
 
 
 class MemoryEntryRepository:
@@ -784,6 +1026,7 @@ class Repositories:
     source_files: SourceFileRepository
     source_chunks: SourceChunkRepository
     memory_entries: MemoryEntryRepository
+    import_runs: SourceImportRunRepository
 
     @classmethod
     def build(cls, conn: sqlite3.Connection) -> "Repositories":
@@ -797,4 +1040,5 @@ class Repositories:
             source_files=SourceFileRepository(conn),
             source_chunks=SourceChunkRepository(conn),
             memory_entries=MemoryEntryRepository(conn),
+            import_runs=SourceImportRunRepository(conn),
         )
