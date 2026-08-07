@@ -59,13 +59,6 @@ try {
         }
     }
 
-    if (-not (Test-Path $aifaqExe)) {
-        throw "aifaq.exe was not found after installation."
-    }
-    if (-not (Test-Path $adminExe)) {
-        throw "aifaq-admin.exe was not found after installation."
-    }
-
     if ($Mode -eq "Menu") {
         Write-Host ""
         Write-Host "AI-FAQ Launcher"
@@ -86,18 +79,21 @@ try {
         }
     }
 
+    # 実行用exeではなくPythonモジュールを起動する。editable install後は、
+    # git pullで更新されたソースをそのまま読み込めるため、日常更新のたびに
+    # エントリーポイントexeを作り直す必要がない。
     switch ($Mode) {
         "Admin" {
-            & $adminExe
+            & $venvPython -m aifaq.admin_cli
         }
         "Chat" {
             if ([string]::IsNullOrWhiteSpace($Requester)) {
                 $Requester = "user"
             }
-            & $aifaqExe chat --requester $Requester
+            & $venvPython -m aifaq chat --requester $Requester
         }
         "Doctor" {
-            & $aifaqExe doctor
+            & $venvPython -m aifaq doctor
         }
     }
 }
