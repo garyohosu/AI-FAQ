@@ -89,24 +89,21 @@ try {
     switch ($Mode) {
         "Admin" {
             & $adminExe
-            exit $LASTEXITCODE
         }
         "Chat" {
             if ([string]::IsNullOrWhiteSpace($Requester)) {
                 $Requester = "user"
             }
             & $aifaqExe chat --requester $Requester
-            exit $LASTEXITCODE
         }
         "Doctor" {
             & $aifaqExe doctor
-            exit $LASTEXITCODE
         }
     }
 }
 catch {
-    Write-Error $_
-    exit 1
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    throw
 }
 finally {
     Pop-Location
