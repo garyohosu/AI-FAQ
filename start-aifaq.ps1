@@ -62,7 +62,7 @@ try {
     if ($Mode -eq "Menu") {
         Write-Host ""
         Write-Host "AI-FAQ Launcher"
-        Write-Host "  1. IT administrator"
+        Write-Host "  1. IT administrator monitor"
         Write-Host "  2. User chat"
         Write-Host "  3. Environment check"
         Write-Host "  Q. Quit"
@@ -84,7 +84,8 @@ try {
     # エントリーポイントexeを作り直す必要がない。
     switch ($Mode) {
         "Admin" {
-            & $venvPython -m aifaq.admin_cli
+            # 未回答が無いときも終了せず、質問が届くまで監視を続ける。
+            & $venvPython -m aifaq.admin_monitor
         }
         "Chat" {
             if ([string]::IsNullOrWhiteSpace($Requester)) {
