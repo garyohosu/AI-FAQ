@@ -19,6 +19,17 @@ C:\PROJECT\AI-FAQ\start-admin.cmd
 
 エクスプローラーから `start-admin.cmd` をダブルクリックしても起動できます。
 
+管理者画面は常駐モニターです。未回答が無い場合も終了せず、既定では2秒ごとに新しい質問を確認します。
+
+```text
+AI-FAQ IT管理者モニター
+回答者: hantani
+新しい質問を2秒ごとに確認します。Ctrl+Cまたは/quitで終了。
+未回答の質問はありません。新しい質問を待っています...
+```
+
+質問が届くと自動的に表示されます。回答を登録した後も、次の質問を待ち続けます。終了するときだけ `Ctrl+C` または回答入力欄で `/quit` を入力してください。
+
 ## 質問者として起動
 
 ```powershell
@@ -35,7 +46,7 @@ C:\PROJECT\AI-FAQ\start-aifaq.cmd
 
 ```text
 AI-FAQ Launcher
-  1. IT administrator
+  1. IT administrator monitor
   2. User chat
   3. Environment check
   Q. Quit
@@ -56,7 +67,7 @@ AI-FAQ Launcher
 C:\PROJECT\AI-FAQ\start-aifaq.ps1 -Update -Mode Admin
 ```
 
-これは `git pull --ff-only` と再インストールを行ってから管理者画面を開きます。ほかのAI-FAQ画面が起動中だと実行ファイルを更新できないため、先に終了してください。
+これは `git pull --ff-only` と再インストールを行ってから管理者モニターを開きます。ほかのAI-FAQ画面が起動中だと実行ファイルを更新できないため、先に終了してください。
 
 ## 強制的に再インストールする
 
