@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aifaq"
-version = "0.1.1"
+version = "0.1.2"
 description = "社内IT管理部門向け 学習型AI FAQ (MVP)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,7 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-aifaq = "aifaq.cli:main"
+aifaq = "aifaq.entrypoint:main"
 aifaq-admin = "aifaq.admin_cli:main"
 
 [tool.setuptools.packages.find]
