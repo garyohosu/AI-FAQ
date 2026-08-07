@@ -1,6 +1,6 @@
 import sys
 
-from aifaq.cli import main
+from aifaq.entrypoint import main
 
 if __name__ == "__main__":
     sys.exit(main())
